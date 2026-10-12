@@ -28,15 +28,16 @@ import (
 
 // Config tunes the relay.
 type Config struct {
-	RequestTTL      time.Duration // how long an unanswered request lives
-	NotesRequestTTL time.Duration // RequestTTL for requests to a notes-kind agent
-	PollHold        time.Duration // max time a long-poll is held
-	DeliveryLease   time.Duration // how long a delivered request waits for a claim
-	ClaimLease      time.Duration // how long a claim lasts before the request is requeued
-	MaxWait         time.Duration // cap on get-reply waits
-	SweepEvery      time.Duration
-	Now             func() time.Time
-	Attachments     AttachmentConfig
+	RequireClaimOwnership []string      // explicit migration; legacy agents keep their existing contract
+	RequestTTL            time.Duration // how long an unanswered request lives
+	NotesRequestTTL       time.Duration // RequestTTL for requests to a notes-kind agent
+	PollHold              time.Duration // max time a long-poll is held
+	DeliveryLease         time.Duration // how long a delivered request waits for a claim
+	ClaimLease            time.Duration // how long a claim lasts before the request is requeued
+	MaxWait               time.Duration // cap on get-reply waits
+	SweepEvery            time.Duration
+	Now                   func() time.Time
+	Attachments           AttachmentConfig
 	// Version is this relay's tincan build, reported to agents in the
 	// roster and whoami so a client behind it stands out; "" hides it.
 	Version string
@@ -255,8 +256,11 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/send", s.handleSend)
 	mux.HandleFunc("GET /v1/poll", s.handlePoll)
+	mux.HandleFunc("GET /v1/peek", s.handlePeek)
 	mux.HandleFunc("POST /v1/replies/ack", s.handleAckReplies)
 	mux.HandleFunc("POST /v1/requests/{id}/claim", s.handleClaim)
+	mux.HandleFunc("POST /v1/requests/{id}/release", s.handleClaimRelease)
+	mux.HandleFunc("GET /v1/requests/{id}/inspect", s.handleInspect)
 	mux.HandleFunc("POST /v1/requests/{id}/progress", s.handleProgress)
 	mux.HandleFunc("POST /v1/requests/{id}/reply", s.handleReply)
 	mux.HandleFunc("POST /v1/requests/{id}/answer", s.handleAnswer)
@@ -301,9 +305,55 @@ func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
 	s.adminRoutes(mux)
+	mux.HandleFunc("POST /v1/admin/enroll-node", s.handleEnrollNode)
+	mux.HandleFunc("POST /v1/admin/rebind-node", s.handleRebindNode)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), localAdminKey, true)))
 	})
+}
+
+func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
+	if !isLocalAdmin(r.Context()) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	var in struct {
+		Name     string `json:"name"`
+		Kind     string `json:"kind"`
+		StableID string `json:"stable_id"`
+		IP       string `json:"ip"`
+		NodeName string `json:"node_name"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		writeErr(w, http.StatusBadRequest, errors.New("enrollment requires one JSON object"))
+		return
+	}
+	if err := knownKind(in.Kind); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	a, created, err := s.dir.EnrollNode(r.Context(), s.remote(r), in.Name, in.Kind, in.StableID, in.IP, in.NodeName)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, identity.ErrEnrollmentConflict) || errors.Is(err, identity.ErrPendingInvite) {
+			status = http.StatusConflict
+		}
+		writeErr(w, status, err)
+		return
+	}
+	state := "unchanged"
+	if created {
+		state = "created"
+		s.record(r.Context(), "enrolled_node", "", "", identity.LocalAdmin, store.DetailJSON(map[string]any{"name": a.Name, "kind": a.Kind, "node_id": a.NodeID, "node_name": a.NodeName, "ip": in.IP}))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": state, "agent": a, "ip": in.IP})
 }
 
 // limitBodies caps every request body at the API limit, except an
@@ -393,7 +443,7 @@ func (s *Server) remote(r *http.Request) string {
 // agents and is refused for a name bound elsewhere. A rebuilt machine that the
 // directory re-admits on the way is audited as a "rebind".
 func (s *Server) agent(w http.ResponseWriter, r *http.Request) string {
-	res, err := s.dir.ResolveAgent(r.Context(), r.RemoteAddr, r.Header.Get(client.AgentHeader))
+	res, actorID, err := s.dir.ResolveActor(r.Context(), r.RemoteAddr, r.Header.Get(client.AgentHeader))
 	if err != nil {
 		code := http.StatusForbidden
 		if errors.Is(err, identity.ErrRebindCheckFailed) {
@@ -402,6 +452,7 @@ func (s *Server) agent(w http.ResponseWriter, r *http.Request) string {
 		writeErr(w, code, err)
 		return ""
 	}
+	*r = *r.WithContext(context.WithValue(r.Context(), authenticatedActorKey{}, authenticatedActor{ID: actorID, Name: res.Name, ServiceRole: res.ServiceRole}))
 	if rb := res.Rebind; rb != nil {
 		log.Printf("rebind: %s moved from %s (%s) to %s (%s)", rb.Agent, rb.OldNodeName, rb.OldNode, rb.NewNodeName, rb.NewNode)
 		s.record(r.Context(), "rebind", "", "", rb.Agent, store.DetailJSON(map[string]any{
@@ -845,13 +896,49 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		return
 	}
-	req, err := s.store.Claim(r.Context(), r.PathValue("id"), name, s.cfg.ClaimLease)
+	var in struct {
+		TaskID    string `json:"task_id"`
+		AttemptID string `json:"attempt_id"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil && err != io.EOF {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid claim body"))
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		writeErr(w, http.StatusBadRequest, errors.New("claim requires one JSON object"))
+		return
+	}
+	var req envelope.Request
+	var err error
+	if in.TaskID != "" || in.AttemptID != "" {
+		a, _ := r.Context().Value(authenticatedActorKey{}).(authenticatedActor)
+		owner := envelope.ClaimOwnership{TaskID: in.TaskID, AttemptID: in.AttemptID, ActorID: a.ID}
+		if !store.ValidClaimOwner(owner, false) {
+			writeErr(w, http.StatusBadRequest, errors.New("task_id and attempt_id are required bounded identifiers"))
+			return
+		}
+		req, err = s.store.ClaimOwned(r.Context(), r.PathValue("id"), name, owner, s.cfg.ClaimLease)
+	} else if slices.Contains(s.cfg.RequireClaimOwnership, name) {
+		err = store.ErrClaimConflict
+	} else {
+		current, _, lookupErr := s.store.Request(r.Context(), r.PathValue("id"))
+		if lookupErr == nil && current.Ownership != nil {
+			err = store.ErrClaimConflict
+		} else {
+			req, err = s.store.Claim(r.Context(), r.PathValue("id"), name, s.cfg.ClaimLease)
+		}
+	}
 	if err != nil {
 		writeErr(w, statusFor(err), err)
 		return
 	}
 	s.hub.notify(requestKey(req.ID))
-	s.record(r.Context(), "claimed", req.ID, req.TraceID, name, "")
+	if req.Ownership == nil {
+		s.record(r.Context(), "claimed", req.ID, req.TraceID, name, "")
+	}
 	writeJSON(w, http.StatusOK, req)
 }
 
@@ -878,6 +965,9 @@ func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(in.Note) == "" {
 		writeErr(w, http.StatusBadRequest, errors.New("note is required"))
+		return
+	}
+	if !s.operationOwner(w, r, name, raw) {
 		return
 	}
 	id := r.PathValue("id")
@@ -908,6 +998,9 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errAttachmentsOff)
 		return
 	}
+	if !s.operationOwner(w, r, name, raw) {
+		return
+	}
 	id := r.PathValue("id")
 	rep, err = s.store.Reply(r.Context(), id, name, rep)
 	if err != nil {
@@ -921,7 +1014,9 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		event = "needs_input"
 		detail = map[string]any{"question_bytes": len(rep.Body)}
 	}
-	s.record(r.Context(), event, id, "", name, store.DetailJSON(detail))
+	if _, owned := r.Context().Value(authenticatedOwnershipKey{}).(bool); !owned {
+		s.record(r.Context(), event, id, "", name, store.DetailJSON(detail))
+	}
 	// The asker learns of the reply from a held poll now, or from a wake
 	// once the waker's grace period shows it went unread.
 	if req, _, err := s.store.Request(r.Context(), id); err == nil {
@@ -1255,6 +1350,16 @@ func (s *Server) isAgent(ctx context.Context, name string) bool {
 // record appends an audit entry. Audit failures are logged, never fatal: the
 // relay keeps delivering if the log cannot be written.
 func (s *Server) record(ctx context.Context, event, requestID, traceID, actor, detail string) {
+	owned, _ := ctx.Value(authenticatedOwnershipKey{}).(bool)
+	if auth, ok := ctx.Value(authenticatedActorKey{}).(authenticatedActor); ok && (auth.ServiceRole || owned) {
+		fields := map[string]any{}
+		if detail != "" {
+			_ = json.Unmarshal([]byte(detail), &fields)
+		}
+		fields["agent"] = auth.Name
+		detail = store.DetailJSON(fields)
+		actor = auth.ID
+	}
 	if traceID == "" && requestID != "" {
 		if req, _, err := s.store.Request(ctx, requestID); err == nil {
 			traceID = req.TraceID
@@ -1353,7 +1458,7 @@ func statusFor(err error) int {
 	case errors.Is(err, store.ErrForbidden), errors.Is(err, identity.ErrNotAdmin), errors.Is(err, identity.ErrNotJoined),
 		errors.Is(err, identity.ErrAgentAmbiguous):
 		return http.StatusForbidden
-	case errors.Is(err, store.ErrWrongState):
+	case errors.Is(err, store.ErrWrongState), errors.Is(err, store.ErrClaimConflict):
 		return http.StatusConflict
 	case errors.Is(err, identity.ErrBadInvite):
 		return http.StatusBadRequest

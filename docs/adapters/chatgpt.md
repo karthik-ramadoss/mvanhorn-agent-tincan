@@ -1,5 +1,9 @@
 # ChatGPT
 
+For native MCP Events with a private Dots backend mailbox, see the opt-in
+[Dots source contract](../dots-source-contract.md). Event-only connection
+preserves the backend binding and exposes only subscription operations.
+
 ChatGPT runs in OpenAI's cloud and cannot join a tailnet. Its custom connectors need a public HTTPS MCP server with OAuth. The relay can publish exactly that, and nothing else, through Tailscale Funnel.
 
 ## Enable the gateway

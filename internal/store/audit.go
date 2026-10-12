@@ -60,8 +60,15 @@ func (s *Store) Audit(ctx context.Context, e AuditEvent) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := s.auditTx(ctx, tx, e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) auditTx(ctx context.Context, tx *sql.Tx, e AuditEvent) error {
 	var prev string
-	err = tx.QueryRowContext(ctx, `SELECT hash FROM audit ORDER BY seq DESC LIMIT 1`).Scan(&prev)
+	err := tx.QueryRowContext(ctx, `SELECT hash FROM audit ORDER BY seq DESC LIMIT 1`).Scan(&prev)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -72,7 +79,7 @@ func (s *Store) Audit(ctx context.Context, e AuditEvent) error {
 		e.At.UnixMilli(), e.Event, e.RequestID, e.TraceID, e.Actor, e.Detail, e.PrevHash, e.Hash); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 // VerifyAudit walks the log and reports the first entry whose hash does not

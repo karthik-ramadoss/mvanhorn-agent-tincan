@@ -19,8 +19,9 @@ type Rebind struct {
 // Resolved is the agent behind a request, and the rebind that re-admitted
 // its machine on this request, if any.
 type Resolved struct {
-	Name   string
-	Rebind *Rebind
+	Name        string
+	Rebind      *Rebind
+	ServiceRole bool // explicit tag grant; actual actor is returned by ResolveActor
 }
 
 // NodeStatus is an optional Resolver extension that reports whether a node,

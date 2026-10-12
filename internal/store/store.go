@@ -196,6 +196,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate approval: %w", err)
 	}
+	if err := s.migrateClaims(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate claims: %w", err)
+	}
 	for {
 		more, err := s.backfillSearchBatch()
 		if err != nil {
@@ -413,6 +417,45 @@ func (s *Store) agentsShape() (hasKind, uniqueNode bool, err error) {
 }
 
 // --- identity.Store ---
+
+func (s *Store) CreateAgent(ctx context.Context, a identity.Agent, now time.Time) (identity.Agent, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return identity.Agent{}, false, err
+	}
+	defer tx.Rollback()
+	// First statement obtains the write lock. No upsert may move a binding.
+	res, err := tx.ExecContext(ctx, `INSERT INTO agents(name,node_id,node_name,joined_at,kind,node_user)
+		SELECT ?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM invites WHERE name=? AND expires>=?)
+		ON CONFLICT(name) DO NOTHING`, a.Name, a.NodeID, a.NodeName, a.JoinedAt.UnixMilli(), nullable(a.Kind), nullable(a.NodeUser), a.Name, now.UnixMilli())
+	if err != nil {
+		return identity.Agent{}, false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return identity.Agent{}, false, err
+	}
+	if n == 1 {
+		return a, true, tx.Commit()
+	}
+	var pending bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM invites WHERE name=? AND expires>=?)`, a.Name, now.UnixMilli()).Scan(&pending); err != nil {
+		return identity.Agent{}, false, err
+	}
+	if pending {
+		return identity.Agent{}, false, identity.ErrPendingInvite
+	}
+	var old identity.Agent
+	var joined int64
+	if err := tx.QueryRowContext(ctx, `SELECT name,node_id,node_name,joined_at,COALESCE(kind,''),COALESCE(node_user,''),COALESCE(good_at,'') FROM agents WHERE name=?`, a.Name).Scan(&old.Name, &old.NodeID, &old.NodeName, &joined, &old.Kind, &old.NodeUser, &old.GoodAt); err != nil {
+		return identity.Agent{}, false, err
+	}
+	old.JoinedAt = time.UnixMilli(joined).UTC()
+	if old.NodeID != a.NodeID || old.NodeName != a.NodeName || old.Kind != a.Kind {
+		return identity.Agent{}, false, identity.ErrEnrollmentConflict
+	}
+	return old, false, tx.Commit()
+}
 
 func (s *Store) PutAgent(ctx context.Context, a identity.Agent) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -841,7 +884,7 @@ func (s *Store) Claim(ctx context.Context, id, agent string, lease time.Duration
 	}
 	now := s.now()
 	res, err := s.db.ExecContext(ctx, `UPDATE requests SET status = ?, lease_until = CASE WHEN kind = ? THEN 0 ELSE ? END, updated_at = ?
-		WHERE id = ? AND status IN (?, ?, ?) AND expires_at > ?`,
+		WHERE id = ? AND claim_actor = '' AND status IN (?, ?, ?) AND expires_at > ?`,
 		string(envelope.StatusClaimed), string(envelope.KindNotify), now.Add(lease).UnixMilli(), now.UnixMilli(), id,
 		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed), now.UnixMilli())
 	if err != nil {
@@ -856,13 +899,16 @@ func (s *Store) Claim(ctx context.Context, id, agent string, lease time.Duration
 
 // SetProgress updates only a current claim and renews its lease.
 func (s *Store) SetProgress(ctx context.Context, id, claimer, note string, lease time.Duration) error {
+	if owner, ok := claimOwner(ctx); ok {
+		return s.progressOwned(ctx, id, claimer, owner, note, lease)
+	}
 	if len(note) > envelope.MaxProgressNote {
 		return envelope.ErrBodyTooLarge
 	}
 	now := s.now()
 	res, err := s.db.ExecContext(ctx, `UPDATE requests SET progress_note = ?, progress_at = ?, updated_at = ?,
 		lease_until = CASE WHEN kind = ? THEN 0 ELSE ? END
-		WHERE id = ? AND to_agent = ? AND status = ? AND (lease_until = 0 OR lease_until > ?)`,
+		WHERE id = ? AND claim_actor = '' AND to_agent = ? AND status = ? AND (lease_until = 0 OR lease_until > ?)`,
 		note, now.UnixMilli(), now.UnixMilli(), string(envelope.KindNotify), now.Add(lease).UnixMilli(),
 		id, claimer, string(envelope.StatusClaimed), now.UnixMilli())
 	if err != nil {
@@ -881,6 +927,9 @@ func (s *Store) SetProgress(ctx context.Context, id, claimer, note string, lease
 // Reply stores the target's reply, closing the request or pausing its lease
 // for needs_input. The reply starts unseen by the asker.
 func (s *Store) Reply(ctx context.Context, id, agent string, rep envelope.Reply) (envelope.Reply, error) {
+	if owner, ok := claimOwner(ctx); ok {
+		return s.replyOwned(ctx, id, agent, owner, rep)
+	}
 	req, _, err := s.lookup(ctx, id)
 	if err != nil {
 		return envelope.Reply{}, err
@@ -898,7 +947,7 @@ func (s *Store) Reply(ctx context.Context, id, agent string, rep envelope.Reply)
 	}
 	defer tx.Rollback()
 	res, err := tx.ExecContext(ctx, `UPDATE requests SET status = ?, lease_until = 0, updated_at = ?, reply_seen_at = CASE WHEN kind = 'ping' THEN ? ELSE 0 END, reply_generation = reply_generation + 1
-		WHERE id = ? AND status IN (?, ?, ?)`,
+		WHERE id = ? AND claim_actor = '' AND status IN (?, ?, ?)`,
 		string(rep.Status), now.UnixMilli(), now.UnixMilli(), id,
 		string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusClaimed))
 	if err != nil {
@@ -1094,7 +1143,7 @@ func (s *Store) Request(ctx context.Context, id string) (envelope.Request, envel
 	return s.lookup(ctx, id)
 }
 
-const requestCols = `id, from_agent, to_agent, parent_id, trace_id, hop, chain, kind, body, status, created_at, attachments, exchanges, resumed, was_held, approved, group_id, urgent, progress_note, progress_at`
+const requestCols = `id, from_agent, to_agent, parent_id, trace_id, hop, chain, kind, body, status, created_at, attachments, exchanges, resumed, was_held, approved, group_id, urgent, progress_note, progress_at, claim_actor, claim_task, claim_attempt, claim_generation, lease_until`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -1103,7 +1152,9 @@ func scanRequest(sc scanner) (envelope.Request, envelope.Status, error) {
 	var chain, kind, status, atts, exchanges string
 	var created, progressAt int64
 	var note string
-	if err := sc.Scan(&r.ID, &r.From, &r.To, &r.ParentID, &r.TraceID, &r.Hop, &chain, &kind, &r.Body, &status, &created, &atts, &exchanges, &r.Resumed, &r.WasHeld, &r.Approved, &r.Group, &r.Urgent, &note, &progressAt); err != nil {
+	var owner envelope.ClaimOwnership
+	var leaseUntil int64
+	if err := sc.Scan(&r.ID, &r.From, &r.To, &r.ParentID, &r.TraceID, &r.Hop, &chain, &kind, &r.Body, &status, &created, &atts, &exchanges, &r.Resumed, &r.WasHeld, &r.Approved, &r.Group, &r.Urgent, &note, &progressAt, &owner.ActorID, &owner.TaskID, &owner.AttemptID, &owner.LeaseGeneration, &leaseUntil); err != nil {
 		return envelope.Request{}, "", err
 	}
 	if err := json.Unmarshal([]byte(chain), &r.Chain); err != nil {
@@ -1115,6 +1166,12 @@ func scanRequest(sc scanner) (envelope.Request, envelope.Status, error) {
 	var err error
 	if r.Attachments, err = decodeAttachments(atts); err != nil {
 		return envelope.Request{}, "", err
+	}
+	if owner.ActorID != "" {
+		if leaseUntil != 0 {
+			owner.LeaseUntil = time.UnixMilli(leaseUntil).UTC()
+		}
+		r.Ownership = &owner
 	}
 	if progressAt != 0 && envelope.Status(status) == envelope.StatusClaimed {
 		r.Progress = &envelope.Progress{Note: note, At: time.UnixMilli(progressAt).UTC(), By: r.To}

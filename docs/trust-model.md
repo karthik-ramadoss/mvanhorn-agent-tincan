@@ -2,6 +2,11 @@
 
 ## What Agent Tincan guarantees
 
+The optional Dots backend role, server claim ownership and event-only gateway
+policy are documented in [the Dots source contract](dots-source-contract.md).
+They require explicit migration; the dedicated role authorizes an environment
+and cannot establish task origin. Deployment of this candidate remains held.
+
 - The relay only listens on your tailnet. The one exception is the optional ChatGPT gateway, which serves only the MCP tools and OAuth on its own Funnel hostname.
 - Every request is attributed to the agent that sent it, using Tailscale's identity for the machine it came from. An agent cannot send as another agent, and whatever it writes in the `from` field is ignored.
 - Only admin devices and the relay's local admin socket can invite, remove, or connect agents, trace every chain, or upgrade the relay (`tincan relay-upgrade`). A caller is an admin device only when all of these hold: Tailscale WhoIs reports its short machine name in the `--admin` list; the node has no Tailscale tags; and, if `--admin-login` is set, the node's owning login is in that list. Machine names are chosen by whoever controls the node, so tag every agent machine (for example `tag:agent`): a tagged node is never an admin, whatever it is called. Owner login alone is not used, because on a single-user tailnet every node, agents included, has the same owner.
@@ -45,6 +50,18 @@ user. Keep the state directory and its parents under the operator's control;
 this is not a hostile-filesystem sandbox or a power-loss durability guarantee.
 
 ## Rebuilt machines
+
+The relay's local admin socket also accepts `POST /v1/admin/rebind-node`
+with `name`, `expected_old_node_id`, `stable_id`, literal Tailscale `ip`, and
+short `node_name`. This route is absent from the tailnet HTTP handler. It
+verifies the target with WhoIs and online status, then atomically replaces
+only the existing node identity if the expected old StableID still matches.
+Missing or changed bindings and pending invitations return HTTP 409. Agent
+metadata, tokens and requests are preserved. The replacement and a
+`rebound_node` audit event commit together; audit failure rolls back the move.
+Retrying a completed move with the original expected old ID returns 409.
+For rollback, verify the original node is online and use the same operation
+with the new ID as the expected old ID and the original node as the target.
 
 Rebuilding a sandbox or VM usually creates a new Tailscale node: a new stable node ID and IP under the same machine name, or that name with a `-1` style suffix if the old node has not expired yet. The relay re-admits such a machine as its old agent on its first call, with no new invite, when all of these hold:
 

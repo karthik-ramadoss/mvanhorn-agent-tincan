@@ -32,19 +32,22 @@ import (
 )
 
 type relayFlags struct {
-	urgentPerHour int
-	listen        string
-	hostname      string
-	stateDir      string
-	port          int
-	admins        []string
-	adminLogins   []string
-	noRebind      bool
-	replyGrace    time.Duration
-	notesTTL      time.Duration
-	dist          string
-	upgradeExit   bool
-	releaseURL    string
+	urgentPerHour  int
+	listen         string
+	hostname       string
+	stateDir       string
+	port           int
+	admins         []string
+	adminLogins    []string
+	noRebind       bool
+	serviceRoles   map[string]string
+	claimOwners    []string
+	eventMailboxes []string
+	replyGrace     time.Duration
+	notesTTL       time.Duration
+	dist           string
+	upgradeExit    bool
+	releaseURL     string
 
 	gateway         bool
 	gatewayHostname string
@@ -89,6 +92,17 @@ then upgrade the relay itself with tincan relay-upgrade: it installs the dist
 build over this binary (which the relay user must own) and re-executes, or
 with --upgrade-exit exits with status 75 for its supervisor to restart it.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := identity.ValidateServiceRoles(f.serviceRoles); err != nil {
+				return err
+			}
+			for _, name := range append(append([]string{}, f.claimOwners...), f.eventMailboxes...) {
+				if !identity.ValidName(name) {
+					return fmt.Errorf("invalid configured agent name %q", name)
+				}
+			}
+			if len(f.eventMailboxes) > 0 && !f.gateway {
+				return errors.New("--gateway-events-only requires --chatgpt-gateway")
+			}
 			if f.urgentPerHour < 1 {
 				return fmt.Errorf("--urgent-per-hour must be at least 1, got %d", f.urgentPerHour)
 			}
@@ -112,6 +126,9 @@ with --upgrade-exit exits with status 75 for its supervisor to restart it.`,
 	cmd.Flags().StringSliceVar(&f.admins, "admin", nil, "machine names allowed to run admin commands (e.g. macbook-pro-44,iphone182)")
 	cmd.Flags().StringSliceVar(&f.adminLogins, "admin-login", nil, "if set, admin machines must also be owned by one of these Tailscale logins")
 	cmd.Flags().BoolVar(&f.noRebind, "no-auto-rebind", false, "do not re-admit rebuilt machines automatically; they need a new invite")
+	cmd.Flags().StringToStringVar(&f.serviceRoles, "service-role", nil, "explicit verified dedicated tag to enrolled logical agent grants (tag:role=agent); disabled by default")
+	cmd.Flags().StringSliceVar(&f.claimOwners, "require-claim-ownership", nil, "agents migrated to server-enforced task/attempt claim ownership")
+	cmd.Flags().StringSliceVar(&f.eventMailboxes, "gateway-events-only", nil, "mailboxes whose gateway OAuth connections may only subscribe to MCP events; preserves backend binding")
 	cmd.Flags().IntVar(&f.urgentPerHour, "urgent-per-hour", 5, "maximum urgent requests per sender per hour")
 	cmd.Flags().DurationVar(&f.replyGrace, "reply-grace", wake.DefaultReplyGrace, "how long a reply may go unread before a webhook or email agent is woken to read it")
 	cmd.Flags().DurationVar(&f.notesTTL, "notes-ttl", 30*24*time.Hour, "how long a request to a notes-kind agent waits unanswered before it expires (other kinds keep 24h)")
@@ -127,12 +144,12 @@ with --upgrade-exit exits with status 75 for its supervisor to restart it.`,
 
 // relayConfig maps the relay flags onto the relay server.
 func (f relayFlags) relayConfig() relay.Config {
-	return relay.Config{Version: Version, NotesRequestTTL: f.notesTTL}
+	return relay.Config{Version: Version, NotesRequestTTL: f.notesTTL, RequireClaimOwnership: f.claimOwners}
 }
 
 // directoryConfig maps the relay flags onto the identity directory.
 func (f relayFlags) directoryConfig() identity.Config {
-	return identity.Config{Admins: f.admins, AdminLogins: f.adminLogins, NoAutoRebind: f.noRebind}
+	return identity.Config{Admins: f.admins, AdminLogins: f.adminLogins, NoAutoRebind: f.noRebind, ServiceRoles: f.serviceRoles}
 }
 
 // loadOrCreateInvitePepper returns the relay's invite-code pepper, creating
@@ -393,7 +410,25 @@ func runRelay(ctx context.Context, f relayFlags) error {
 			return err
 		}
 		srv.SetConnector(gateway.Connector{Dir: dir, OAuth: oauth, Base: base})
-		gw := client.Configure(&http.Server{Handler: gateway.New(base, oauth, srv.Handler(), Version).Handler()}, client.RelayAPI)
+		g := gateway.New(base, oauth, srv.Handler(), Version)
+		if len(f.eventMailboxes) > 0 {
+			if err = oauth.ConfigureEvents(strings.TrimRight(base, "/")+"/mcp", f.eventMailboxes); err != nil {
+				return err
+			}
+			if err = st.InitEvents(); err != nil {
+				return err
+			}
+			sender := gateway.NewWebhookSender()
+			g.ConfigureEventStore(st, sender)
+			worker := gateway.NewEventDeliveryWorker(st, oauth, sender)
+			srv.SetEvents(eventDeliveryHints{base: waker, wake: worker.Wake})
+			go func() {
+				if err := worker.Run(ctx); err != nil {
+					errc <- err
+				}
+			}()
+		}
+		gw := client.Configure(&http.Server{Handler: g.Handler()}, client.RelayAPI)
 		go func() { errc <- gw.Serve(gln) }()
 		servers = append(servers, gw)
 		log.Printf("chatgpt gateway serving at %s/mcp", base)

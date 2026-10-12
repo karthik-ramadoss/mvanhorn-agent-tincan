@@ -83,19 +83,20 @@ func (s Status) Terminal() bool {
 
 // Request is one agent asking another to do something.
 type Request struct {
-	Exchanges []Exchange `json:"exchanges,omitempty"`
-	Resumed   bool       `json:"resumed,omitempty"`
-	Group     string     `json:"group,omitempty"`
-	Urgent    bool       `json:"urgent,omitempty"`
-	ID        string     `json:"id,omitempty"`
-	From      string     `json:"from,omitempty"`
-	To        string     `json:"to"`
-	ParentID  string     `json:"parent_id,omitempty"`
-	TraceID   string     `json:"trace_id,omitempty"`
-	Hop       int        `json:"hop,omitempty"`
-	Chain     []string   `json:"chain,omitempty"`
-	Kind      Kind       `json:"kind,omitempty"`
-	Body      string     `json:"body"`
+	Ownership *ClaimOwnership `json:"ownership,omitempty"`
+	Exchanges []Exchange      `json:"exchanges,omitempty"`
+	Resumed   bool            `json:"resumed,omitempty"`
+	Group     string          `json:"group,omitempty"`
+	Urgent    bool            `json:"urgent,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	From      string          `json:"from,omitempty"`
+	To        string          `json:"to"`
+	ParentID  string          `json:"parent_id,omitempty"`
+	TraceID   string          `json:"trace_id,omitempty"`
+	Hop       int             `json:"hop,omitempty"`
+	Chain     []string        `json:"chain,omitempty"`
+	Kind      Kind            `json:"kind,omitempty"`
+	Body      string          `json:"body"`
 	// Attachments are files stored on the relay. A relay that predates
 	// attachments ignores the field, so clients send it only when the relay
 	// advertises support.
@@ -112,6 +113,16 @@ type Request struct {
 	// WasHeld and Approved are persisted relay-only approval history.
 	WasHeld  bool `json:"-"`
 	Approved bool `json:"-"`
+}
+
+// ClaimOwnership is a server-issued lease receipt. ActorID comes from
+// authentication, never from the submitted ownership object.
+type ClaimOwnership struct {
+	TaskID          string    `json:"task_id"`
+	AttemptID       string    `json:"attempt_id"`
+	ActorID         string    `json:"actor_id,omitempty"`
+	LeaseGeneration int64     `json:"lease_generation"`
+	LeaseUntil      time.Time `json:"lease_until,omitzero"`
 }
 
 // RedactFor hides content that the owner has never released to other agents.
