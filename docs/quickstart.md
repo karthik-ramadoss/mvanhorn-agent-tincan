@@ -18,9 +18,9 @@ On the router first, then on your admin device and each agent's machine, run:
 curl -fsSL https://agenttincan.com/install.sh | sh
 ```
 
-It picks the build for the machine (macOS on Apple silicon or Intel, Linux on x86-64 or ARM64), downloads the newest release, checks it against the release's `checksums.txt`, installs it to `~/.local/bin/tincan` without `sudo`, and prints `tincan version`. If `~/.local/bin` is not on your PATH it tells you how to add it. `TINCAN_INSTALL_DIR=<dir>` installs elsewhere; `TINCAN_VERSION=v0.5.0` pins a release.
+It picks the build for the machine (macOS on Apple silicon or Intel, Linux on x86-64 or ARM64), downloads the newest stable release, checks it against the release's `checksums.txt`, installs it to `~/.local/bin/tincan` without `sudo`, and prints `tincan version`. If `~/.local/bin` is not on your PATH it tells you how to add it. `TINCAN_INSTALL_DIR=<dir>` installs elsewhere; `TINCAN_VERSION=v0.5.0` pins a release. Prereleases such as `v0.6.0-rc1` install only when `TINCAN_VERSION` names them.
 
-Or download manually from the [releases page](https://github.com/mvanhorn/agent-tincan/releases): `tincan_<os>_<arch>` plus `checksums.txt`. There is no Windows build; build from source with `make build` (Go 1.26 or newer).
+Or download manually from the [releases page](https://github.com/mvanhorn/agent-tincan/releases): `tincan_<os>_<arch>` plus `checksums.txt`. There is no Windows build; build from source with `make build` (Go 1.26.9 or newer).
 
 ## 3. Start the relay
 
@@ -31,10 +31,10 @@ TS_AUTHKEY=tskey-auth-... tincan relay --admin my-laptop
 ```
 
 - It joins your tailnet as `tincan-relay`, so agents reach it at `http://tincan-relay`.
-- `--admin` lists the machine names (as shown by `tailscale status`) allowed to invite and remove agents. On the relay host you can always use the local admin socket instead: `tincan invite muse --socket <state-dir>/admin.sock`. The path is printed at startup. The default state dir is `~/.config/tincan-relay` on Linux and `~/Library/Application Support/tincan-relay` on macOS, which has a space, so quote it: `--socket "$HOME/Library/Application Support/tincan-relay/admin.sock"`.
+- `--admin` lists the machine names (as shown by `tailscale status`) allowed to invite and remove agents. The relay host is always an admin with no flags: `tincan invite muse` there uses its local admin socket. Pass `--socket <state-dir>/admin.sock` only when the relay runs with a non-default `--state-dir` (the path is printed at startup; on macOS the default dir has a space, so quote it).
 - A machine is an admin only if its name is in `--admin` and it has no Tailscale tags. Tag your agent machines (for example `tag:agent`, via `tailscale up --advertise-tags=tag:agent` or an auth key with that tag) so they can never be admins, even if one is renamed to match an admin machine.
 - `--admin-login you@example.com` additionally requires an admin machine to be owned by that Tailscale login. It narrows admin rights on shared tailnets, but on a single-user tailnet every node has the same owner, so the machine list and tags still do the real work.
-- If the host already runs tailscaled and you would rather not add a node, use `--listen 100.x.y.z --port 8787` with the host's tailnet IP. The default is better: its own node keeps a stable name and IP even when the host re-joins Tailscale. Back up the state dir either way.
+- If the host already runs tailscaled and you would rather not add a node, use `--listen 100.x.y.z --port 8787` with the host's tailnet IP. The default is better: its own node keeps a stable name and IP even when the host re-joins Tailscale. With `--listen`, agents that can see the tailnet find a new host IP themselves; a proxy-only agent needs `tincan rejoin`. Back up the state dir either way.
 
 Run it under your service manager (systemd, launchd) so it restarts.
 
@@ -54,7 +54,9 @@ tincan join ABCD-EFGH --relay http://tincan-relay
 
 Repeat for muse (`tincan invite muse --relay http://tincan-relay` on the admin device, then `tincan join <code> --relay http://tincan-relay` on muse's machine).
 
-Check with `tincan agents`. An admin device never joins, so it has no saved relay: pass it with `tincan agents --relay http://tincan-relay` (or set `TINCAN_RELAY=http://tincan-relay`), or use `--socket` on the relay host. A joined agent just runs `tincan agents`. It also shows when each agent last called the relay, by polling or by any send, reply, or get ("last seen 12m ago", or "never seen").
+Owners can watch the mesh with `tincan top --relay http://tincan-relay` (no flags on the relay host). It refreshes every 2 seconds; `--interval 5s` changes the cadence, and `q` or Ctrl-C quits. Admin devices see held approvals and recent chains alongside the roster. `tincan top --once` prints a read-only snapshot.
+
+Check with `tincan agents`. An admin device never joins, so it has no saved relay: pass it with `tincan agents --relay http://tincan-relay` (or set `TINCAN_RELAY=http://tincan-relay`), or run it on the relay host, where it needs no flags. A joined agent just runs `tincan agents`. It also shows when each agent last called the relay, by polling or by any send, reply, or get ("last seen 12m ago", or "never seen"), and which tincan build each last called with, next to the relay's own, so an agent that needs `tincan upgrade` stands out.
 
 ## Rebuilt machines
 
@@ -136,7 +138,7 @@ tincan trace <trace-id> # one chain, step by step
 tincan audit-verify     # check the log has not been altered
 ```
 
-On an admin device that never joined, add `--relay http://tincan-relay` to each (or set `TINCAN_RELAY`); on the relay host, `--socket <state-dir>/admin.sock` works too.
+On an admin device that never joined, add `--relay http://tincan-relay` to each (or set `TINCAN_RELAY`). On the relay host they need no flags: its local admin socket is used. Pass `--socket <state-dir>/admin.sock` only for a socket elsewhere.
 
 ## Upgrading
 
@@ -148,7 +150,7 @@ On the relay host, keep a dist directory and start the relay with it:
 tincan relay --admin my-laptop --dist ~/tincan-dist
 ```
 
-For each release, the relay operator drops the raw binaries into that directory, named `tincan_<os>_<arch>` (`tincan_linux_amd64`, `tincan_linux_arm64`, `tincan_darwin_arm64`, `tincan_darwin_amd64`), plus the release's `checksums.txt` and a `VERSION` file holding the release number (for example `0.4.0`). The relay serves only those names, and only to joined agents and admin devices. It never needs a restart to pick up a new release.
+For each release, either run `tincan relay-upgrade --from-github v0.8.0` from your admin device (see below; the relay needs `--release-url`), which has the relay fetch the release into that directory itself, or drop the raw binaries into it by hand, named `tincan_<os>_<arch>` (`tincan_linux_amd64`, `tincan_linux_arm64`, `tincan_darwin_arm64`, `tincan_darwin_amd64`), plus the release's `checksums.txt` and a `VERSION` file holding the release number (for example `0.4.0`). The relay serves only those names, and only to joined agents and admin devices. It never needs a restart to pick up a new release.
 
 On each agent's machine:
 
@@ -157,6 +159,19 @@ tincan upgrade --check   # current version and what the relay has
 tincan upgrade           # download, verify sha256, replace the binary
 ```
 
-`tincan upgrade` picks the build for its own platform, checks its sha256 against the relay's manifest, writes it next to the running binary, and renames it into place (a new file, so macOS never kills a signed binary rewritten in place). If the relay has no build for the platform or the checksum does not match, it stops with an error and leaves the old binary as it was. Afterwards, restart any long-running tincan processes (`tincan wait` or `tincan listen` loops, `tincan mcp` servers); they keep running the old build until then.
+`tincan upgrade` picks the build for its own platform, checks its sha256 against the relay's manifest, writes it next to the running binary, and renames it into place (a new file, so macOS never kills a signed binary rewritten in place). If the relay has no build for the platform or the checksum does not match, it stops with an error and leaves the old binary as it was. Afterwards, restart any long-running tincan processes (`tincan wait` or `tincan listen` loops, `tincan mcp` servers); they keep running the old build until then. `tincan upgrade` names each running `tincan mcp` still on the old build with its app's reload step (see [Upgrades](../README.md#upgrades)), and a running `tincan mcp` tells the agent in its next tool result once its binary has been replaced.
 
 `tincan upgrade` trusts the relay host. The checksum and the binary both come from the same relay, so the check protects against a corrupted or truncated download, not against a compromised relay. Only put release files you built yourself or downloaded from your own GitHub release into `--dist`.
+
+### Upgrading the relay
+
+The relay upgrades itself from an admin device, so nobody needs a shell on the relay host:
+
+```bash
+tincan relay-upgrade --relay http://tincan-relay --from-github v0.8.0   # fetch the release into --dist, then install it
+tincan relay-upgrade --relay http://tincan-relay                        # install what is already in --dist
+```
+
+`--from-github` needs the relay started with `--release-url https://github.com/mvanhorn/agent-tincan/releases/download`; without it the relay makes no outbound download. The relay then downloads that release's four binaries and `checksums.txt` from there, checks each binary against that `checksums.txt`, and moves them into `--dist`, `VERSION` last. Then, either way, it checks its own platform's build against the dist `checksums.txt`, writes it next to its running binary, keeps the old one as `<binary>.<old version>`, renames the new one into place, replies with both versions, and restarts. By default it re-executes itself with the same arguments. If a supervisor restarts it, start the relay with `--upgrade-exit` and it exits with status 75 instead (with systemd, use `Restart=on-failure` or `Restart=always`). `tincan relay-upgrade` waits up to a minute for the relay to answer on the new build; `tincan agents` also names the relay's build on its first line.
+
+It refuses a release that is not newer (`--force` reinstalls), a missing build, a checksum mismatch, and a binary the relay user cannot replace, and changes nothing when it does. Self-upgrade needs the relay user to own its binary and the directory it is in; if you keep the binary root-owned, upgrade the relay by hand. Only admin devices and the relay's own admin socket can run it; agents get 403.

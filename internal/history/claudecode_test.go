@@ -34,7 +34,7 @@ func claudeFixture(t *testing.T) *ClaudeCode {
 
 func TestClaudeCodeLatestSkipsSDKSubagentsScratchAndToolResults(t *testing.T) {
 	r := claudeFixture(t)
-	got, err := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeLatest, WantImages: true}, Options{})
+	got, err := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeLatest, WantImages: true}, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestClaudeCodeLatestSkipsSDKSubagentsScratchAndToolResults(t *testing.T) {
 
 func TestClaudeCodeSearchDecodesImagesOnSelectedTurnOnly(t *testing.T) {
 	r := claudeFixture(t)
-	got, err := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"diagram"}, WantImages: true}, Options{})
+	got, err := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"diagram"}, WantImages: true}, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestClaudeCodeSearchDecodesImagesOnSelectedTurnOnly(t *testing.T) {
 
 func TestClaudeCodeSearchExclusionsAndAll(t *testing.T) {
 	r := claudeFixture(t)
-	got, err := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"fox"}}, Options{})
+	got, err := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"fox"}}, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestClaudeCodeSearchExclusionsAndAll(t *testing.T) {
 	if ids(got) != ccS4 {
 		t.Fatalf("search fox = %s, want S4", ids(got))
 	}
-	got, err = r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"fox"}}, Options{All: true})
+	got, err = convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"fox"}}, Options{All: true}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,12 +104,12 @@ func TestClaudeCodeSearchExclusionsAndAll(t *testing.T) {
 
 func TestClaudeCodeRecencyWindow(t *testing.T) {
 	r := claudeFixture(t)
-	got, _ := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"pelicans"}}, Options{})
+	got, _ := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"pelicans"}}, Options{}))
 	if ids(got) != ccS6 {
 		t.Fatalf("pelicans = %s", ids(got))
 	}
 	r.Window = Window{Max: 1, MaxAge: DefaultWindow().MaxAge}
-	got, _ = r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"pelicans"}}, Options{})
+	got, _ = convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeSearch, Terms: []string{"pelicans"}}, Options{}))
 	if len(got) != 0 {
 		t.Fatalf("match outside the window returned: %s", ids(got))
 	}
@@ -117,7 +117,7 @@ func TestClaudeCodeRecencyWindow(t *testing.T) {
 
 func TestClaudeCodeList(t *testing.T) {
 	r := claudeFixture(t)
-	got, err := r.List(context.Background(), 10, Options{})
+	got, err := convsOf(r.List(context.Background(), 10, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestClaudeCodeList(t *testing.T) {
 	if got[0].Title != "Relay design" || got[1].Title == "" {
 		t.Fatalf("titles = %q %q", got[0].Title, got[1].Title)
 	}
-	got, _ = r.List(context.Background(), 10, Options{All: true})
+	got, _ = convsOf(r.List(context.Background(), 10, Options{All: true}))
 	if want := strings.Join([]string{ccS2, ccS1, ccS6, ccS4}, ","); ids(got) != want {
 		t.Fatalf("list --all = %s, want %s", ids(got), want)
 	}
@@ -135,7 +135,7 @@ func TestClaudeCodeList(t *testing.T) {
 
 func TestClaudeCodeConversationByID(t *testing.T) {
 	r := claudeFixture(t)
-	got, err := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeConversation, ConversationID: ccS1}, Options{})
+	got, err := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeConversation, ConversationID: ccS1}, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,20 +147,20 @@ func TestClaudeCodeConversationByID(t *testing.T) {
 	if strings.Join(roles, "|") != want {
 		t.Fatalf("messages = %q", roles)
 	}
-	if _, err := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeConversation, ConversationID: ccS2}, Options{}); err == nil {
+	if _, err := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeConversation, ConversationID: ccS2}, Options{})); err == nil {
 		t.Fatal("sdk-cli session returned without --all")
 	}
-	if _, err := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeConversation, ConversationID: ccS3}, Options{All: true}); err == nil {
+	if _, err := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeConversation, ConversationID: ccS3}, Options{All: true})); err == nil {
 		t.Fatal("scratch session returned")
 	}
-	if _, err := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeConversation, ConversationID: "agent-fake"}, Options{All: true}); err == nil {
+	if _, err := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeConversation, ConversationID: "agent-fake"}, Options{All: true})); err == nil {
 		t.Fatal("subagent transcript returned")
 	}
 }
 
 func TestClaudeCodeMissingRootIsAClearError(t *testing.T) {
 	r := &ClaudeCode{Root: filepath.Join(t.TempDir(), "nope"), Now: func() time.Time { return fixtureNow }}
-	if _, err := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeLatest}, Options{}); err == nil {
+	if _, err := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeLatest}, Options{})); err == nil {
 		t.Fatal("missing root: want error")
 	}
 	var reader Reader = r
@@ -170,7 +170,7 @@ func TestClaudeCodeMissingRootIsAClearError(t *testing.T) {
 }
 
 func TestClaudeCodeSlashCommandWithArgsIsAPrompt(t *testing.T) {
-	text, ok := claudePromptText("<command-message>ce-plan is running</command-message>\n<command-name>/ce-plan</command-name>\n<command-args>add a fox mode</command-args>")
+	text, ok := claudePromptText("<command-message>ce-plan is running</command-message>\n<command-name>/ce-plan</command-name>\n<command-args>add a fox mode</command-args>", false)
 	if !ok || text != "/ce-plan add a fox mode" {
 		t.Fatalf("slash command = %q %v", text, ok)
 	}
@@ -182,8 +182,8 @@ func TestClaudeCodeSlashCommandWithArgsIsAPrompt(t *testing.T) {
 		"[Request interrupted by user]",
 		"   ",
 	} {
-		if got, ok := claudePromptText(s); ok {
-			t.Errorf("claudePromptText(%q) = %q, want skipped", s, got)
+		if got, ok := claudePromptText(s, false); ok {
+			t.Errorf("claudePromptText(%q, false) = %q, want skipped", s, got)
 		}
 	}
 }
@@ -191,7 +191,7 @@ func TestClaudeCodeSlashCommandWithArgsIsAPrompt(t *testing.T) {
 func TestClaudeCodeWithImagesPicksOlderTurnThatHasImages(t *testing.T) {
 	r := claudeFixture(t)
 	// The newest prompt in S1 has no image; the earlier one attached red.
-	got, err := r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeLatest, WithImages: true}, Options{})
+	got, err := convsOf(r.Read(context.Background(), Query{Source: SourceClaudeCode, Mode: ModeLatest, WithImages: true}, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,5 +204,44 @@ func TestClaudeCodeWithImagesPicksOlderTurnThatHasImages(t *testing.T) {
 	}
 	if colors(t, u.Images) != "red" {
 		t.Fatalf("images = %s, want red", colors(t, u.Images))
+	}
+}
+
+func TestClaudeCodeInjectedElementIsNotAPrompt(t *testing.T) {
+	for _, s := range []string{
+		"<scheduled-task>\n<task-id>nightly</task-id>\nrun the nightly report\n</scheduled-task>",
+		"<create-pr-command>open a PR for this branch</create-pr-command>",
+		"<some-new-kind id=\"7\">\nwhatever the Desktop app adds next\n</some-new-kind>",
+	} {
+		if got, ok := claudePromptText(s, true); ok {
+			t.Errorf("claudePromptText(%q, true) = %q, want skipped", s, got)
+		}
+	}
+	for _, s := range []string{
+		"<b>bold</b> is html, so why does <i> exist?",
+		"what does <br> do",
+		"<foo> is a tag I saw in a transcript, what is it?",
+		"[Image #1] summarize the relay design in this diagram",
+		"<instructions>\nRefactor the relay auth to use mTLS\n</instructions>",
+		"<svg viewBox=\"0 0 1 1\"></svg>",
+		"<b>Note</b>: fix <b>today</b>",
+		"<my-notes>first</my-notes> and <my-notes>second</my-notes>",
+	} {
+		if got, ok := claudePromptText(s, true); !ok || got != s {
+			t.Errorf("claudePromptText(%q, true) = %q %v, want the prompt", s, got, ok)
+		}
+	}
+}
+
+// Only a record that came in as sdk (how the Desktop app injects) can be
+// dropped as an unlisted injected element; the same text typed, queued or
+// with no promptSource is the owner's prompt.
+func TestClaudeCodeInjectedElementNeedsSDKSource(t *testing.T) {
+	s := "<review-notes>\nlook at the relay retry loop\n</review-notes>"
+	if got, ok := claudePromptText(s, false); !ok || got != s {
+		t.Fatalf("typed %q dropped: %q %v", s, got, ok)
+	}
+	if _, ok := claudePromptText(s, true); ok {
+		t.Fatalf("sdk %q kept as a prompt", s)
 	}
 }

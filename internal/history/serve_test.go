@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -40,24 +44,30 @@ func (f *fakeExtractor) questions() []string {
 	return append([]string(nil), f.seen...)
 }
 
-// fakeReader answers every Read with fixed conversations (or an error).
+// fakeReader answers every Read with fixed conversations (or an error),
+// and records the queries and options it was given.
 type fakeReader struct {
 	mu      sync.Mutex
 	source  Source
 	convs   []Conversation
 	err     error
 	queries []Query
+	opts    []Options
+	// limited is the page's limit reason.
+	limited Limit
+	// maxCap caps the applied Max, as a live source's list cap does.
+	maxCap int
 	// block makes Read wait for its context to end and return its error.
 	block bool
 }
 
 func (f *fakeReader) Source() Source { return f.source }
 
-func (f *fakeReader) List(context.Context, int, Options) ([]Conversation, error) {
-	return nil, errors.New("not used")
+func (f *fakeReader) List(context.Context, int, Options) (Page, error) {
+	return Page{}, errors.New("not used")
 }
 
-func (f *fakeReader) Read(ctx context.Context, q Query, _ Options) ([]Conversation, error) {
+func (f *fakeReader) Read(ctx context.Context, q Query, opts Options) (Page, error) {
 	f.mu.Lock()
 	block := f.block
 	f.mu.Unlock()
@@ -65,14 +75,16 @@ func (f *fakeReader) Read(ctx context.Context, q Query, _ Options) ([]Conversati
 		<-ctx.Done()
 		f.mu.Lock()
 		f.queries = append(f.queries, q)
+		f.opts = append(f.opts, opts)
 		f.mu.Unlock()
-		return nil, ctx.Err()
+		return Page{}, ctx.Err()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queries = append(f.queries, q)
+	f.opts = append(f.opts, opts)
 	if f.err != nil {
-		return nil, f.err
+		return Page{}, f.err
 	}
 	// Hand out a copy so SaveImages on one request never touches the next.
 	out := make([]Conversation, len(f.convs))
@@ -83,7 +95,18 @@ func (f *fakeReader) Read(ctx context.Context, q Query, _ Options) ([]Conversati
 		}
 		out[i] = c
 	}
-	return out, nil
+	w := effectiveWindow(Window{}, opts)
+	if f.maxCap > 0 {
+		w.Max = min(w.Max, f.maxCap)
+	}
+	return Page{Conversations: out, Limited: f.limited, Window: w}, nil
+}
+
+// options returns the Options of every Read so far.
+func (f *fakeReader) options() []Options {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]Options(nil), f.opts...)
 }
 
 func (f *fakeReader) reads() int {
@@ -157,7 +180,7 @@ func (r *serveRig) ask(t *testing.T, from, body string) client.Result {
 	t.Helper()
 	ctx := t.Context()
 	c := r.mesh.Client(t, from)
-	req, err := c.Send(ctx, "history", body, envelope.KindAsk, "")
+	req, err := c.Send(ctx, "history", body, envelope.KindAsk, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,14 +267,14 @@ func forwardViaCodex(t *testing.T, m *testrelay.Mesh, agent, question string) (*
 	t.Helper()
 	ctx := t.Context()
 	muse, codex := m.Client(t, "muse"), m.Client(t, "codex")
-	orig, err := muse.Send(ctx, "codex", "ask "+agent+" for me", envelope.KindAsk, "")
+	orig, err := muse.Send(ctx, "codex", "ask "+agent+" for me", envelope.KindAsk, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := codex.Claim(ctx, orig.ID); err != nil {
 		t.Fatal(err)
 	}
-	fwd, err := codex.Send(ctx, agent, question, envelope.KindAsk, orig.ID)
+	fwd, err := codex.Send(ctx, agent, question, envelope.KindAsk, orig.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +537,7 @@ func TestServeRunSurvivesBadRequestAndStopsOnCancel(t *testing.T) {
 	rig.chatgpt.mu.Lock()
 	rig.chatgpt.err = errors.New("disk on fire")
 	rig.chatgpt.mu.Unlock()
-	bad, err := grok.Send(t.Context(), "history", "last ChatGPT prompt", envelope.KindAsk, "")
+	bad, err := grok.Send(t.Context(), "history", "last ChatGPT prompt", envelope.KindAsk, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,7 +548,7 @@ func TestServeRunSurvivesBadRequestAndStopsOnCancel(t *testing.T) {
 	rig.chatgpt.mu.Lock()
 	rig.chatgpt.err = nil
 	rig.chatgpt.mu.Unlock()
-	good, err := grok.Send(t.Context(), "history", "last ChatGPT prompt", envelope.KindAsk, "")
+	good, err := grok.Send(t.Context(), "history", "last ChatGPT prompt", envelope.KindAsk, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -674,4 +697,519 @@ func TestServeWithImagesNothingFound(t *testing.T) {
 		t.Fatalf("reply %q", res.Reply.Body)
 	}
 	rig.assertNoImageDirsLeft(t)
+}
+
+func TestRenderReplyLongConversationShowsNewestPrompts(t *testing.T) {
+	c := Conversation{Source: SourceCodex, ID: "01a0c000-0000-7000-8000-00000000000a", Title: "Long thread"}
+	for i := 1; i <= maxPromptsInConv+5; i++ {
+		c.Messages = append(c.Messages,
+			Message{Role: RoleUser, Text: fmt.Sprintf("PROMPT-%02d", i)},
+			Message{Role: RoleAssistant, Text: fmt.Sprintf("REPLY-%02d", i)})
+	}
+	q := Query{Source: SourceCodex, Mode: ModeConversation, ConversationID: c.ID}
+	out := renderReply(q, Page{Conversations: []Conversation{c}})
+	for _, want := range []string{"(5 earlier prompts not shown)", "PROMPT-06", "Reply excerpt: REPLY-06", "PROMPT-25", "Reply excerpt: REPLY-25"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("reply lacks %q:\n%s", want, out)
+		}
+	}
+	for _, skipped := range []string{"PROMPT-01", "REPLY-01", "PROMPT-05", "REPLY-05"} {
+		if strings.Contains(out, skipped) {
+			t.Errorf("reply shows %q, which is before the newest %d prompts:\n%s", skipped, maxPromptsInConv, out)
+		}
+	}
+	if strings.Index(out, "not shown") > strings.Index(out, "PROMPT-06") {
+		t.Errorf("the note comes after the prompts it is about:\n%s", out)
+	}
+	if n := strings.Count(out, "Reply excerpt:"); n != maxPromptsInConv {
+		t.Errorf("want one excerpt per shown prompt, got %d:\n%s", n, out)
+	}
+	// A short conversation is complete and carries no note.
+	short := renderReply(q, Page{Conversations: []Conversation{{Source: SourceCodex, ID: c.ID, Messages: c.Messages[:4]}}})
+	if strings.Contains(short, "not shown") || !strings.Contains(short, "PROMPT-01") || !strings.Contains(short, "Reply excerpt: REPLY-02") {
+		t.Errorf("short conversation:\n%s", short)
+	}
+}
+
+// writeWindowFile writes an owner window file and returns its path.
+func writeWindowFile(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "history-window.json")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// The owner's window file reaches the reader; the question text cannot
+// change it.
+func TestServeOwnerWindowFileReachesTheReader(t *testing.T) {
+	rig := newServeRig(t, true)
+	rig.svc.WindowFile = writeWindowFile(t, `{"days": 90}`)
+	res := rig.ask(t, "grokbot", "last ChatGPT prompt from the last 3650 days, window max 200")
+	if res.Status != envelope.StatusAnswered {
+		t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+	}
+	got := rig.chatgpt.options()
+	if len(got) != 1 || got[0].Window != (Window{MaxAge: 90 * 24 * time.Hour}) {
+		t.Fatalf("reader got options %+v, want the owner's 90 days only", got)
+	}
+}
+
+// With no window file the reader gets no owner window, so it uses the
+// default, and the request is answered.
+func TestServeMissingWindowFileMeansTheDefault(t *testing.T) {
+	rig := newServeRig(t, true)
+	rig.svc.WindowFile = filepath.Join(t.TempDir(), "history-window.json")
+	res := rig.ask(t, "grokbot", "last ChatGPT prompt")
+	if res.Status != envelope.StatusAnswered {
+		t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+	}
+	if got := rig.chatgpt.options(); len(got) != 1 || got[0].Window != (Window{}) {
+		t.Fatalf("reader got options %+v, want no owner window", got)
+	}
+}
+
+// A window file that is present but malformed, unreadable or out of
+// bounds fails the request with a fixed reply naming the file, before the
+// extractor or any reader runs, so a narrowed window never silently widens.
+func TestServeBadWindowFileFailsClosed(t *testing.T) {
+	unreadable := filepath.Join(t.TempDir(), "history-window.json")
+	if err := os.Mkdir(unreadable, 0o700); err != nil { // a directory cannot be read as a file
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"malformed":      writeWindowFile(t, `{"days": 90`),
+		"unknown field":  writeWindowFile(t, `{"days": 90, "weeks": 2}`),
+		"zero days":      writeWindowFile(t, `{"days": 0}`),
+		"too many days":  writeWindowFile(t, `{"days": 3651}`),
+		"max too big":    writeWindowFile(t, `{"max": 201}`),
+		"null":           writeWindowFile(t, `null`),
+		"null max":       writeWindowFile(t, `{"max": null}`),
+		"null days":      writeWindowFile(t, `{"days": null}`),
+		"both null":      writeWindowFile(t, `{"days": null, "max": null}`),
+		"too large":      writeWindowFile(t, `{"days": 90}`+strings.Repeat(" ", 64<<10)),
+		"trailing brace": writeWindowFile(t, `{"days": 90}}`),
+		"duplicate days": writeWindowFile(t, `{"days": 7, "days": 90}`),
+		"unreadable":     unreadable,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newServeRig(t, true)
+			var log bytes.Buffer
+			rig.svc.Log = &log
+			rig.svc.WindowFile = path
+			res := rig.ask(t, "grokbot", "last ChatGPT prompt")
+			if res.Status != envelope.StatusFailed {
+				t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+			}
+			want := "The history agent could not use its window file (history-window.json), so it is not answering until the owner fixes it."
+			if res.Reply.Body != want {
+				t.Fatalf("reply %q, want %q", res.Reply.Body, want)
+			}
+			if rig.chatgpt.reads() != 0 || len(rig.ext.questions()) != 0 {
+				t.Fatalf("reader ran %d times, extractor saw %v", rig.chatgpt.reads(), rig.ext.questions())
+			}
+			if !strings.Contains(log.String(), "window file "+path) {
+				t.Fatalf("error not logged: %q", log.String())
+			}
+		})
+	}
+}
+
+// A live source clamps the owner's max to its list cap; the reply names
+// the window that was applied.
+func TestServeReplyNamesTheAppliedWindow(t *testing.T) {
+	rig := newServeRig(t, true)
+	rig.svc.WindowFile = writeWindowFile(t, `{"max": 200}`)
+	rig.chatgpt.maxCap = MaxListCount
+	rig.chatgpt.convs = nil
+	rig.chatgpt.limited = LimitCount
+	rig.ext.q = Query{Source: SourceChatGPT, Mode: ModeSearch, Terms: []string{"sourdough"}}
+	res := rig.ask(t, "grokbot", "the ChatGPT chat about sourdough")
+	if res.Status != envelope.StatusAnswered {
+		t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+	}
+	body := res.Reply.Body
+	if !strings.Contains(body, "the last 100 conversations, up to 30 days") || strings.Contains(body, "200") || strings.Contains(body, " 50 ") {
+		t.Fatalf("reply does not name the applied window of 100:\n%s", body)
+	}
+	if !strings.Contains(body, "Only the last 100 ChatGPT conversations were searched") {
+		t.Fatalf("reply lacks the count limit line:\n%s", body)
+	}
+}
+
+// A search the age cap cut short still shows its match, plus the fixed
+// limit line.
+func TestServeAgeLimitedSearchWithAMatchSaysSo(t *testing.T) {
+	rig := newServeRig(t, true)
+	rig.svc.WindowFile = writeWindowFile(t, `{"days": 7}`)
+	rig.chatgpt.limited = LimitAge
+	rig.ext.q = Query{Source: SourceChatGPT, Mode: ModeSearch, Terms: []string{"fox"}}
+	res := rig.ask(t, "grokbot", "the ChatGPT chats about the fox logo")
+	if res.Status != envelope.StatusAnswered {
+		t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+	}
+	body := res.Reply.Body
+	for _, want := range []string{"Fox logo ideas", "make the ears bigger like this sketch", "Only ChatGPT conversations from the last 7 days were searched, so older ones may be missing."} {
+		if !strings.Contains(body, want) {
+			t.Errorf("reply missing %q:\n%s", want, body)
+		}
+	}
+	// A complete answer carries no limit line.
+	rig.chatgpt.limited = LimitNone
+	res = rig.ask(t, "grokbot", "the ChatGPT chats about the fox logo")
+	if strings.Contains(res.Reply.Body, "were searched") {
+		t.Fatalf("complete answer carries a limit line:\n%s", res.Reply.Body)
+	}
+}
+
+func TestLoadWindow(t *testing.T) {
+	if w, err := LoadWindow(filepath.Join(t.TempDir(), "missing.json")); err != nil || w != (Window{}) {
+		t.Fatalf("missing: %+v, %v", w, err)
+	}
+	if w, err := LoadWindow(writeWindowFile(t, `{}`)); err != nil || w != (Window{}) {
+		t.Fatalf("empty object: %+v, %v", w, err)
+	}
+	w, err := LoadWindow(writeWindowFile(t, `{"days": 3650, "max": 200}`))
+	if err != nil || w != (Window{Max: 200, MaxAge: 3650 * 24 * time.Hour}) {
+		t.Fatalf("upper bounds: %+v, %v", w, err)
+	}
+	w, err = LoadWindow(writeWindowFile(t, `{"days": 1, "max": 1}`))
+	if err != nil || w != (Window{Max: 1, MaxAge: 24 * time.Hour}) {
+		t.Fatalf("lower bounds: %+v, %v", w, err)
+	}
+	w, err = LoadWindow(writeWindowFile(t, `{"max": 7}`))
+	if err != nil || w != (Window{Max: 7}) {
+		t.Fatalf("omitted days: %+v, %v", w, err)
+	}
+	// An omitted field means the default; an explicit null is malformed, as
+	// is a top-level null, so none of them silently falls back.
+	for _, bad := range []string{``, `[]`, `{"days": -1}`, `{"max": 0}`, `{"days": "90"}`, `{"days": 90} {"days": 1}`, `{"days": 1.5}`,
+		`null`, ` null `, `{"max": null}`, `{"days": null}`, `{"days": null, "max": null}`, `{"days": 7, "max": null}`, `null {}`,
+		`{"days": 90}}`, `{"days": 90}]`, `{"days": 90} x`, `{"days": 7, "days": 90}`, `{"max": 1, "max": 200}`} {
+		if w, err := LoadWindow(writeWindowFile(t, bad)); err == nil {
+			t.Errorf("accepted %q as %+v", bad, w)
+		}
+	}
+	// The read itself is bounded: a file over 64 KiB is refused even when
+	// it starts with a valid object.
+	if w, err := LoadWindow(writeWindowFile(t, `{"days": 90}`+strings.Repeat(" ", 64<<10))); err == nil {
+		t.Errorf("accepted an oversized file as %+v", w)
+	}
+	// Exactly 64 KiB is still read.
+	exact := `{"days": 90}`
+	if w, err := LoadWindow(writeWindowFile(t, exact+strings.Repeat(" ", 64<<10-len(exact)))); err != nil || w != (Window{MaxAge: 90 * 24 * time.Hour}) {
+		t.Errorf("64 KiB file: %+v, %v", w, err)
+	}
+}
+
+// hookReader calls before ahead of each Read of the wrapped fake reader.
+type hookReader struct {
+	*fakeReader
+	before func(ctx context.Context)
+}
+
+func (h hookReader) Read(ctx context.Context, q Query, o Options) (Page, error) {
+	h.before(ctx)
+	return h.fakeReader.Read(ctx, q, o)
+}
+
+// While the service handles a slow request it keeps its relay presence
+// fresh (a peek that claims nothing), so it does not show offline and a
+// request queued meanwhile stays queued.
+func TestServePresenceDuringSlowRequest(t *testing.T) {
+	rig := newServeRig(t, false)
+	rig.svc.PresenceInterval = 10 * time.Millisecond
+	codex := rig.mesh.Client(t, "codex")
+	var (
+		start    time.Time
+		lastPoll time.Time
+		queuedID string
+	)
+	rig.svc.Readers[SourceChatGPT] = hookReader{fakeReader: rig.chatgpt, before: func(ctx context.Context) {
+		start = time.Now()
+		q, err := codex.Send(ctx, "history", "a second question", envelope.KindAsk, "", false)
+		if err != nil {
+			t.Error(err)
+		}
+		queuedID = q.ID
+		time.Sleep(200 * time.Millisecond)
+		agents, err := codex.Agents(ctx)
+		if err != nil {
+			t.Error(err)
+		}
+		for _, a := range agents {
+			if a.Name == "history" {
+				lastPoll = a.LastPoll
+			}
+		}
+	}}
+	res := rig.ask(t, "grokbot", "what was the last thing Matt asked ChatGPT?")
+	if res.Status != envelope.StatusAnswered {
+		t.Fatalf("%s %q", res.Status, res.Reply.Body)
+	}
+	if !lastPoll.After(start) {
+		t.Fatalf("last poll %s is not after the slow read began (%s): no presence during the request", lastPoll, start)
+	}
+	got, err := codex.Get(t.Context(), queuedID, 0)
+	if err != nil || got.Status != envelope.StatusQueued {
+		t.Fatalf("the request queued during the read: %s %v (want still queued)", got.Status, err)
+	}
+}
+
+// A structured query, marked by a "query:" first line, skips the extractor
+// and reaches the reader as parsed. Both marker forms work.
+func TestServeStructuredQuerySkipsTheExtractor(t *testing.T) {
+	for name, body := range map[string]string{
+		"marker line":       "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\"}",
+		"same line":         "query: {\"source\":\"chatgpt\",\"mode\":\"latest\"}",
+		"same line no gap":  "query:{\"source\":\"chatgpt\",\"mode\":\"latest\"}",
+		"upper case marker": "  QUERY:  \n{\"source\":\"chatgpt\",\"mode\":\"latest\"}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newServeRig(t, true)
+			res := rig.ask(t, "grokbot", body)
+			if res.Status != envelope.StatusAnswered {
+				t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+			}
+			if got := rig.ext.questions(); len(got) != 0 {
+				t.Fatalf("extractor saw %q, want no model step", got)
+			}
+			if !strings.Contains(res.Reply.Body, "Fox logo ideas") {
+				t.Fatalf("reply is not the templated answer: %q", res.Reply.Body)
+			}
+			rig.chatgpt.mu.Lock()
+			q := slices.Clone(rig.chatgpt.queries)
+			rig.chatgpt.mu.Unlock()
+			if len(q) != 1 || q[0].Source != SourceChatGPT || q[0].Mode != ModeLatest || q[0].WantImages {
+				t.Fatalf("reader got %+v, want the structured query", q)
+			}
+		})
+	}
+}
+
+// A first line that only starts with "query:" in prose stays on the
+// free-text path, and so do "query" without the colon and a marker that
+// is not on the first line.
+func TestServeQueryProseGoesToTheExtractor(t *testing.T) {
+	for _, body := range []string{
+		"Query: what did I ask ChatGPT",
+		"query: [\"chatgpt\"]",
+		"query\n{\"source\":\"chatgpt\",\"mode\":\"latest\"}",
+		"please run this\nquery:\n{\"source\":\"chatgpt\",\"mode\":\"latest\"}",
+	} {
+		rig := newServeRig(t, true)
+		res := rig.ask(t, "grokbot", body)
+		if res.Status != envelope.StatusAnswered {
+			t.Fatalf("%q: status %s body %q", body, res.Status, res.Reply.Body)
+		}
+		if got := rig.ext.questions(); len(got) != 1 || got[0] != body {
+			t.Fatalf("%q: extractor saw %q, want the question", body, got)
+		}
+	}
+}
+
+// A malformed structured query gets the structured-query reply naming the
+// schema, never the model and never a reader.
+func TestServeBadStructuredQueryFails(t *testing.T) {
+	for name, body := range map[string]string{
+		"unknown field":         "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\",\"days\":3650}",
+		"window field":          "query: {\"source\":\"chatgpt\",\"mode\":\"latest\",\"window\":{\"max\":200}}",
+		"bad source":            "query:\n{\"source\":\"myspace\",\"mode\":\"latest\"}",
+		"no source":             "query:\n{\"mode\":\"latest\"}",
+		"over-limit count":      "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\",\"count\":500}",
+		"no mode":               "query:\n{\"source\":\"chatgpt\"}",
+		"not json":              "query:\nthe last ChatGPT prompt please",
+		"empty":                 "query:",
+		"two objects":           "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\"}\n{\"source\":\"codex\",\"mode\":\"latest\"}",
+		"bad id":                "query:\n{\"source\":\"chatgpt\",\"mode\":\"conversation\",\"conversation_id\":\"../../etc\"}",
+		"broken same line":      "query: {\"source\":\"chatgpt\",",
+		"trailing brace":        "query: {\"source\":\"chatgpt\",\"mode\":\"latest\"}}",
+		"repeated source":       "query: {\"source\":\"codex\",\"source\":\"chatgpt\",\"mode\":\"latest\"}",
+		"repeated mode":         "query: {\"source\":\"chatgpt\",\"mode\":\"search\",\"mode\":\"latest\"}",
+		"null count":            "query: {\"source\":\"chatgpt\",\"mode\":\"latest\",\"count\":null}",
+		"null source":           "query: {\"source\":null,\"mode\":\"latest\"}",
+		"null terms":            "query: {\"source\":\"chatgpt\",\"mode\":\"search\",\"terms\":null}",
+		"trailing bracket":      "query: {\"source\":\"chatgpt\",\"mode\":\"latest\"}]",
+		"trailing junk":         "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\"}\nand then some",
+		"trailing value":        "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\"} 1",
+		"code fence":            "query:\n```json\n{\"source\":\"chatgpt\",\"mode\":\"latest\"}\n```",
+		"bare code fence":       "query:\n```\n{\"source\":\"chatgpt\",\"mode\":\"latest\"}\n```",
+		"terms on latest":       "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\",\"terms\":[\"relay\"]}",
+		"nine terms on latest":  "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\",\"terms\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]}",
+		"nine terms on search":  "query:\n{\"source\":\"chatgpt\",\"mode\":\"search\",\"terms\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]}",
+		"blank term":            "query:\n{\"source\":\"chatgpt\",\"mode\":\"search\",\"terms\":[\"relay\",\"  \"]}",
+		"id on latest":          "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\",\"conversation_id\":\"conv-1\"}",
+		"bad id on latest":      "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\",\"conversation_id\":\"../../etc\"}",
+		"id on search":          "query:\n{\"source\":\"chatgpt\",\"mode\":\"search\",\"terms\":[\"fox\"],\"conversation_id\":\"conv-1\"}",
+		"terms on conversation": "query:\n{\"source\":\"chatgpt\",\"mode\":\"conversation\",\"conversation_id\":\"conv-1\",\"terms\":[\"fox\"]}",
+		"padded id":             "query:\n{\"source\":\"chatgpt\",\"mode\":\"conversation\",\"conversation_id\":\" conv-1 \"}",
+		"unknown source":        "query:\n{\"source\":\"unknown\",\"mode\":\"latest\"}",
+		"negative count":        "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\",\"count\":-1}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newServeRig(t, true)
+			res := rig.ask(t, "grokbot", body)
+			if res.Status != envelope.StatusFailed {
+				t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+			}
+			if !strings.HasPrefix(res.Reply.Body, "The structured query was not valid") {
+				t.Fatalf("reply %q, want the invalid structured query template", res.Reply.Body)
+			}
+			assertStructuredHelp(t, res.Reply.Body)
+			if len(rig.ext.questions()) != 0 || rig.chatgpt.reads() != 0 {
+				t.Fatalf("extractor saw %v, reader ran %d times", rig.ext.questions(), rig.chatgpt.reads())
+			}
+		})
+	}
+}
+
+// Each structured mode reaches the reader with exactly the fields sent,
+// including a tab between the marker and same-line JSON.
+func TestServeStructuredQueryModesReachTheReader(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want Query
+	}{
+		"tab same line": {"query:\t{\"source\":\"chatgpt\",\"mode\":\"latest\",\"count\":2}",
+			Query{Source: SourceChatGPT, Mode: ModeLatest, Count: 2}},
+		"search": {"query:\n{\"source\":\"chatgpt\",\"mode\":\"search\",\"terms\":[\"fox\",\"logo ideas\"],\"count\":3}",
+			Query{Source: SourceChatGPT, Mode: ModeSearch, Terms: []string{"fox", "logo ideas"}, Count: 3}},
+		"conversation": {"query:\n{\"source\":\"chatgpt\",\"mode\":\"conversation\",\"conversation_id\":\"conv-1\",\"with_images\":true}",
+			Query{Source: SourceChatGPT, Mode: ModeConversation, ConversationID: "conv-1", WantImages: true, WithImages: true}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newServeRig(t, true)
+			res := rig.ask(t, "grokbot", tc.body)
+			if res.Status != envelope.StatusAnswered {
+				t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+			}
+			if got := rig.ext.questions(); len(got) != 0 {
+				t.Fatalf("extractor saw %q, want no model step", got)
+			}
+			rig.chatgpt.mu.Lock()
+			q := slices.Clone(rig.chatgpt.queries)
+			rig.chatgpt.mu.Unlock()
+			if len(q) != 1 || !reflect.DeepEqual(q[0], tc.want) {
+				t.Fatalf("reader got %+v, want %+v", q, tc.want)
+			}
+		})
+	}
+}
+
+// A structured query of exactly MaxQuestionBytes is accepted.
+func TestServeStructuredQueryAtTheLimitIsAccepted(t *testing.T) {
+	rig := newServeRig(t, true)
+	body := "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\"}"
+	body += strings.Repeat(" ", MaxQuestionBytes-len(body))
+	if len(body) != MaxQuestionBytes {
+		t.Fatalf("body is %d bytes", len(body))
+	}
+	res := rig.ask(t, "grokbot", body)
+	if res.Status != envelope.StatusAnswered {
+		t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+	}
+	if len(rig.ext.questions()) != 0 || rig.chatgpt.reads() != 1 {
+		t.Fatalf("extractor saw %v, reader ran %d times", rig.ext.questions(), rig.chatgpt.reads())
+	}
+}
+
+// A structured query longer than MaxQuestionBytes fails before parsing.
+func TestServeOversizedStructuredQueryFails(t *testing.T) {
+	rig := newServeRig(t, true)
+	body := "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\"}" + strings.Repeat(" ", MaxQuestionBytes)
+	res := rig.ask(t, "grokbot", body)
+	if res.Status != envelope.StatusFailed {
+		t.Fatalf("status %s body %q", res.Status, res.Reply.Body)
+	}
+	if !strings.HasPrefix(res.Reply.Body, "The structured query is too long") {
+		t.Fatalf("reply %q, want the too long template", res.Reply.Body)
+	}
+	assertStructuredHelp(t, res.Reply.Body)
+	if len(rig.ext.questions()) != 0 || rig.chatgpt.reads() != 0 {
+		t.Fatalf("extractor saw %v, reader ran %d times", rig.ext.questions(), rig.chatgpt.reads())
+	}
+}
+
+// A disallowed agent is declined on its relay-set identity before its
+// structured query is looked at.
+func TestServeStructuredQueryFromDisallowedAgentIsDeclined(t *testing.T) {
+	rig := newServeRig(t, true)
+	var log bytes.Buffer
+	rig.svc.Log = &log
+	rig.svc.Allowlist = StaticAllowlist("grokbot")
+	res := rig.ask(t, "muse", "query:\n{\"source\":\"chatgpt\",\"mode\":\"latest\",\"days\":1}")
+	if res.Status != envelope.StatusDeclined || !strings.Contains(res.Reply.Body, "muse") {
+		t.Fatalf("status %s body %q, want declined naming muse", res.Status, res.Reply.Body)
+	}
+	if len(rig.ext.questions()) != 0 || rig.chatgpt.reads() != 0 {
+		t.Fatal("a declined request reached the extractor or a reader")
+	}
+	if strings.Contains(log.String(), "structured query") {
+		t.Fatalf("the structured query was parsed for a declined agent: %q", log.String())
+	}
+}
+
+// assertStructuredHelp checks a structured-query failure names every
+// accepted field, mode and source, and is not the free-text clarifying
+// reply.
+func assertStructuredHelp(t *testing.T, body string) {
+	t.Helper()
+	for _, want := range []string{"query:", "source", "mode", "terms", "conversation_id", "count", "want_images", "with_images", "latest", "search", "conversation"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("reply missing %q: %q", want, body)
+		}
+	}
+	for _, s := range Sources {
+		if !strings.Contains(body, string(s)) {
+			t.Errorf("reply missing source %q: %q", s, body)
+		}
+	}
+	if strings.Contains(body, "clearer question") {
+		t.Errorf("reply is the free-text clarifying text: %q", body)
+	}
+}
+
+func TestHistoryAnswersPingWithoutHandling(t *testing.T) {
+	rig := newServeRig(t, false)
+	if _, err := rig.svc.Relay.Peek(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
+	sender := rig.mesh.Client(t, "grokbot")
+	req, err := sender.Send(t.Context(), "history", "", envelope.KindPing, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := rig.svc.PollOnce(t.Context())
+	if err != nil || n != 0 {
+		t.Fatalf("handled ping as work: %d %v", n, err)
+	}
+	res, err := sender.Get(t.Context(), req.ID, 0)
+	if err != nil || res.Reply == nil || !strings.Contains(res.Reply.Body, "history-serve") {
+		t.Fatalf("pong: %+v %v", res, err)
+	}
+}
+
+func TestPollAndHandlePingFailurePreservesWork(t *testing.T) {
+	for _, status := range []int{409, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/poll" {
+					fmt.Fprint(w, `{"requests":[{"id":"ping","kind":"ping"},{"id":"work","kind":"ask","body":"real work"}]}`)
+					return
+				}
+				http.Error(w, `{"error":"ping failed"}`, status)
+			}))
+			defer ts.Close()
+			relay, err := client.NewRelay(ts.URL, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var handled []string
+			n, err := PollAndHandle(t.Context(), relay, time.Second, "history-serve", func(_ context.Context, req envelope.Request) { handled = append(handled, req.ID) })
+			if err != nil || n != 1 || !slices.Equal(handled, []string{"work"}) {
+				t.Fatalf("handled %v (%d): %v", handled, n, err)
+			}
+		})
+	}
 }

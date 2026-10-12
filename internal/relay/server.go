@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,19 +28,27 @@ import (
 
 // Config tunes the relay.
 type Config struct {
-	RequestTTL    time.Duration // how long an unanswered request lives
-	PollHold      time.Duration // max time a long-poll is held
-	DeliveryLease time.Duration // how long a delivered request waits for a claim
-	ClaimLease    time.Duration // how long a claim lasts before the request is requeued
-	MaxWait       time.Duration // cap on get-reply waits
-	SweepEvery    time.Duration
-	Now           func() time.Time
-	Attachments   AttachmentConfig
+	RequireClaimOwnership []string      // explicit migration; legacy agents keep their existing contract
+	RequestTTL            time.Duration // how long an unanswered request lives
+	NotesRequestTTL       time.Duration // RequestTTL for requests to a notes-kind agent
+	PollHold              time.Duration // max time a long-poll is held
+	DeliveryLease         time.Duration // how long a delivered request waits for a claim
+	ClaimLease            time.Duration // how long a claim lasts before the request is requeued
+	MaxWait               time.Duration // cap on get-reply waits
+	SweepEvery            time.Duration
+	Now                   func() time.Time
+	Attachments           AttachmentConfig
+	// Version is this relay's tincan build, reported to agents in the
+	// roster and whoami so a client behind it stands out; "" hides it.
+	Version string
 }
 
 func (c *Config) defaults() {
 	if c.RequestTTL == 0 {
 		c.RequestTTL = 24 * time.Hour
+	}
+	if c.NotesRequestTTL == 0 {
+		c.NotesRequestTTL = 30 * 24 * time.Hour
 	}
 	if c.PollHold == 0 {
 		c.PollHold = client.DefaultPollHold
@@ -67,6 +77,12 @@ type Preparer interface {
 	Prepare(ctx context.Context, req *envelope.Request) error
 }
 
+// Refunder is an optional Preparer that gives back what Prepare took (the
+// urgent allowance) when the relay then fails to queue the request.
+type Refunder interface {
+	Refund(req envelope.Request)
+}
+
 // Events lets other parts of the relay react to queue changes (wake, audit).
 type Events interface {
 	Queued(ctx context.Context, req envelope.Request)
@@ -86,18 +102,24 @@ type Replier interface {
 
 // Server is the relay.
 type Server struct {
-	cfg    Config
-	dir    *identity.Directory
-	store  *store.Store
-	hub    *hub
-	prep   Preparer
-	events Events
-	wake   WakeNamer
-	conn   Connector
-	dist   *dist
-	blobs  string   // attachment directory, "" when attachments are off
-	key    string   // relay key, proves this relay's identity to its agents (hello)
-	urls   []string // addresses advertised to agents in whoami
+	cfg Config
+	dir *identity.Directory
+	// lookupAgent is how requestTTL reads the recipient's kind; it is
+	// dir.Agent, replaced in tests to simulate a failed lookup.
+	lookupAgent func(ctx context.Context, name string) (identity.Agent, bool, error)
+	store       *store.Store
+	hub         *hub
+	prep        Preparer
+	events      Events
+	wake        WakeNamer
+	conn        Connector
+	dist        *dist
+	blobs       string   // attachment directory, "" when attachments are off
+	key         string   // relay key, proves this relay's identity to its agents (hello)
+	urls        []string // addresses advertised to agents in whoami
+
+	// upgrader installs the dist release over the relay binary; nil when off.
+	upgrader SelfUpgrader
 
 	mu       sync.Mutex
 	lastPoll map[string]time.Time
@@ -107,16 +129,97 @@ type Server struct {
 	// persistEvery per agent.
 	lastSeen  map[string]time.Time
 	persisted map[string]time.Time
+	// versions is the tincan build each agent last called with, from the
+	// client's version header, loaded from the store at start and written
+	// back whenever it changes.
+	versions     map[string]string
+	pollFeatures map[string]pollFeatures
+	// started is when this relay process started. lastPoll is not
+	// persisted, so a schedule agent that has not polled since then is
+	// measured from here rather than flagged overdue by a restart.
+	started time.Time
+	// pollMu orders each poll-feature update with its store write, so two
+	// overlapping polls persist in the order they changed the state.
+	pollMu sync.Mutex
+	// storedVersion is the build last written to the store for each agent,
+	// and versionWritten when. The write is throttled like last-seen, so two
+	// builds running under one name (an old listen or MCP process next to an
+	// upgraded CLI) do not write to the store on every alternating call.
+	storedVersion  map[string]string
+	versionWritten map[string]time.Time
+
+	// stopping is closed by Stop, when the relay begins to shut down.
+	stopping chan struct{}
+	stopOnce sync.Once
 }
 
 // persistEvery bounds how often an agent's activity is written to the store.
 const persistEvery = time.Minute
 
+// legacyPollWindow keeps mixed-version receivers from accepting unanswerable pings.
+const legacyPollWindow = 24 * time.Hour
+
+// pollFeaturesPersistEvery bounds how often a legacy poller's last-seen time
+// is written; the in-memory value is always current.
+const pollFeaturesPersistEvery = time.Hour
+
+// pollFeatures intentionally excludes advertisements from non-poll calls.
+// The legacy features column cannot establish whether a receiver supports ping.
+type pollFeatures struct {
+	Ping            bool
+	LastUnsupported time.Time
+}
+
 // New builds a relay server.
 func New(dir *identity.Directory, st *store.Store, cfg Config) *Server {
 	cfg.defaults()
-	return &Server{cfg: cfg, dir: dir, store: st, hub: newHub(), prep: newChain{}, lastPoll: map[string]time.Time{}, polling: map[string]int{},
-		lastSeen: map[string]time.Time{}, persisted: map[string]time.Time{}, blobs: defaultAttachmentDir(st), key: loadRelayKey(st)}
+	s := &Server{cfg: cfg, dir: dir, store: st, hub: newHub(), prep: newChain{}, lastPoll: map[string]time.Time{}, polling: map[string]int{},
+		lastSeen: map[string]time.Time{}, persisted: map[string]time.Time{}, versions: loadVersions(st), blobs: defaultAttachmentDir(st), key: loadRelayKey(st),
+		versionWritten: map[string]time.Time{}, stopping: make(chan struct{}), started: cfg.Now()}
+	s.lookupAgent = dir.Agent
+	s.storedVersion = maps.Clone(s.versions)
+	s.pollFeatures = map[string]pollFeatures{}
+	states, err := st.PollFeatures(context.Background())
+	if err != nil {
+		log.Printf("poll features: %v", err)
+	}
+	for name, state := range states {
+		var f pollFeatures
+		if json.Unmarshal([]byte(state), &f) == nil {
+			s.pollFeatures[name] = f
+		}
+	}
+	return s
+}
+
+// loadVersions reads the build each agent last reported, so a restarted
+// relay's roster shows them before the agents call again. A failed read is
+// logged; versions are then learned again as agents call.
+func loadVersions(st *store.Store) map[string]string {
+	if st == nil {
+		return map[string]string{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	vs, err := st.AgentVersions(ctx)
+	if err != nil {
+		log.Printf("agent versions: %v", err)
+		return map[string]string{}
+	}
+	return vs
+}
+
+// versionRE is what a client's build name may look like before the relay
+// records it: git describe output such as 0.5.2 or 0.5.2-3-gabcdef-dirty.
+var versionRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
+
+// cleanVersion returns v when it is a plausible build name, else "".
+func cleanVersion(v string) string {
+	v = strings.TrimSpace(v)
+	if !versionRE.MatchString(v) {
+		return ""
+	}
+	return v
 }
 
 // SetPreparer installs the chain and policy step.
@@ -153,10 +256,16 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/send", s.handleSend)
 	mux.HandleFunc("GET /v1/poll", s.handlePoll)
+	mux.HandleFunc("GET /v1/peek", s.handlePeek)
 	mux.HandleFunc("POST /v1/replies/ack", s.handleAckReplies)
 	mux.HandleFunc("POST /v1/requests/{id}/claim", s.handleClaim)
+	mux.HandleFunc("POST /v1/requests/{id}/release", s.handleClaimRelease)
+	mux.HandleFunc("GET /v1/requests/{id}/inspect", s.handleInspect)
+	mux.HandleFunc("POST /v1/requests/{id}/progress", s.handleProgress)
 	mux.HandleFunc("POST /v1/requests/{id}/reply", s.handleReply)
+	mux.HandleFunc("POST /v1/requests/{id}/answer", s.handleAnswer)
 	mux.HandleFunc("GET /v1/requests/{id}", s.handleGet)
+	mux.HandleFunc("GET /v1/groups/{id}", s.handleGroup)
 	mux.HandleFunc("POST /v1/requests/{id}/cancel", s.handleCancel)
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
 	mux.HandleFunc("GET /v1/whoami", s.handleWhoAmI)
@@ -172,16 +281,22 @@ func (s *Server) Handler() http.Handler {
 // adminRoutes registers the routes served on both the tailnet API (for admin
 // devices) and the local admin socket. /v1/agents is added by the caller.
 func (s *Server) adminRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/admin/held", s.handleHeld)
+	mux.HandleFunc("POST /v1/admin/requests/{id}/approve", s.handleApprove)
+	mux.HandleFunc("POST /v1/admin/requests/{id}/deny", s.handleDeny)
 	mux.HandleFunc("POST /v1/admin/invite", s.handleInvite)
 	mux.HandleFunc("GET /v1/admin/urls", s.handleAdminURLs)
 	mux.HandleFunc("POST /v1/admin/remove", s.handleRemove)
 	mux.HandleFunc("PUT /v1/agents/{name}/kind", s.handleSetKind)
+	mux.HandleFunc("PUT /v1/agents/{name}/good-at", s.handleSetGoodAt)
 	mux.HandleFunc("POST /v1/admin/connect", s.handleConnect)
 	mux.HandleFunc("GET /v1/trace/{trace}", s.handleTrace)
 	mux.HandleFunc("GET /v1/trace", s.handleRecent)
+	mux.HandleFunc("GET /v1/search", s.handleSearch)
 	mux.HandleFunc("GET /v1/admin/audit/verify", s.handleVerify)
+	mux.HandleFunc("POST /v1/admin/relay/upgrade", s.handleSelfUpgrade)
 	mux.HandleFunc("GET /v1/capabilities", s.handleCapabilities)
-	mux.HandleFunc("GET /v1/attachments/{id}", s.handleFetch)
+	mux.HandleFunc("GET /v1/attachments/{id}", s.handleApprovalFetch)
 }
 
 // AdminHandler serves only admin routes and treats every caller as the local
@@ -190,9 +305,55 @@ func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/agents", s.handleAgents)
 	s.adminRoutes(mux)
+	mux.HandleFunc("POST /v1/admin/enroll-node", s.handleEnrollNode)
+	mux.HandleFunc("POST /v1/admin/rebind-node", s.handleRebindNode)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), localAdminKey, true)))
 	})
+}
+
+func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
+	if !isLocalAdmin(r.Context()) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	var in struct {
+		Name     string `json:"name"`
+		Kind     string `json:"kind"`
+		StableID string `json:"stable_id"`
+		IP       string `json:"ip"`
+		NodeName string `json:"node_name"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		writeErr(w, http.StatusBadRequest, errors.New("enrollment requires one JSON object"))
+		return
+	}
+	if err := knownKind(in.Kind); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	a, created, err := s.dir.EnrollNode(r.Context(), s.remote(r), in.Name, in.Kind, in.StableID, in.IP, in.NodeName)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, identity.ErrEnrollmentConflict) || errors.Is(err, identity.ErrPendingInvite) {
+			status = http.StatusConflict
+		}
+		writeErr(w, status, err)
+		return
+	}
+	state := "unchanged"
+	if created {
+		state = "created"
+		s.record(r.Context(), "enrolled_node", "", "", identity.LocalAdmin, store.DetailJSON(map[string]any{"name": a.Name, "kind": a.Kind, "node_id": a.NodeID, "node_name": a.NodeName, "ip": in.IP}))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": state, "agent": a, "ip": in.IP})
 }
 
 // limitBodies caps every request body at the API limit, except an
@@ -206,6 +367,13 @@ func limitBodies(h http.Handler) http.Handler {
 		h.ServeHTTP(w, r)
 	})
 }
+
+// Stop ends every held long poll and get-reply wait at once with the answer
+// its hold deadline would give (nothing yet, poll again), and makes later
+// ones answer without holding. The relay calls it first when it shuts down,
+// so held calls do not keep the process alive. Request contexts stay live,
+// so calls already in flight finish normally. Stop is idempotent.
+func (s *Server) Stop() { s.stopOnce.Do(func() { close(s.stopping) }) }
 
 // Run sweeps expired requests and leases, and applies attachment retention
 // at start and every Attachments.SweepEvery, until ctx ends.
@@ -238,6 +406,9 @@ func (s *Server) Sweep(ctx context.Context) {
 		event := "requeued"
 		if t.Status == envelope.StatusExpired {
 			event = "expired"
+			if t.Held {
+				event = "hold_expired"
+			}
 		}
 		s.record(ctx, event, t.ID, t.TraceID, "relay", "")
 		s.hub.notify(requestKey(t.ID))
@@ -245,7 +416,7 @@ func (s *Server) Sweep(ctx context.Context) {
 			s.hub.notify(inboxKey(t.To))
 			// An agent woken by the relay has no poller to see the requeue,
 			// so wake it again; pollers are skipped by the waker itself.
-			req := envelope.Request{ID: t.ID, TraceID: t.TraceID, From: t.From, To: t.To}
+			req := envelope.Request{ID: t.ID, TraceID: t.TraceID, From: t.From, To: t.To, Urgent: t.Urgent}
 			if rq, ok := s.events.(Requeuer); ok {
 				rq.Requeued(ctx, req)
 			} else if s.events != nil {
@@ -272,7 +443,7 @@ func (s *Server) remote(r *http.Request) string {
 // agents and is refused for a name bound elsewhere. A rebuilt machine that the
 // directory re-admits on the way is audited as a "rebind".
 func (s *Server) agent(w http.ResponseWriter, r *http.Request) string {
-	res, err := s.dir.ResolveAgent(r.Context(), r.RemoteAddr, r.Header.Get(client.AgentHeader))
+	res, actorID, err := s.dir.ResolveActor(r.Context(), r.RemoteAddr, r.Header.Get(client.AgentHeader))
 	if err != nil {
 		code := http.StatusForbidden
 		if errors.Is(err, identity.ErrRebindCheckFailed) {
@@ -281,22 +452,58 @@ func (s *Server) agent(w http.ResponseWriter, r *http.Request) string {
 		writeErr(w, code, err)
 		return ""
 	}
+	*r = *r.WithContext(context.WithValue(r.Context(), authenticatedActorKey{}, authenticatedActor{ID: actorID, Name: res.Name, ServiceRole: res.ServiceRole}))
 	if rb := res.Rebind; rb != nil {
 		log.Printf("rebind: %s moved from %s (%s) to %s (%s)", rb.Agent, rb.OldNodeName, rb.OldNode, rb.NewNodeName, rb.NewNode)
 		s.record(r.Context(), "rebind", "", "", rb.Agent, store.DetailJSON(map[string]any{
 			"agent": rb.Agent, "old_node": rb.OldNode, "old_node_name": rb.OldNodeName, "new_node": rb.NewNode, "new_node_name": rb.NewNodeName,
 		}))
 	}
-	s.seen(r.Context(), res.Name)
+	s.seen(r.Context(), res.Name, r.Header.Get(client.VersionHeader))
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/poll" {
+		supported := false
+		for f := range strings.SplitSeq(r.Header.Get(client.FeaturesHeader), ",") {
+			if strings.TrimSpace(f) == "ping" {
+				supported = true
+			}
+		}
+		now := s.cfg.Now()
+		s.pollMu.Lock()
+		defer s.pollMu.Unlock()
+		s.mu.Lock()
+		old := s.pollFeatures[res.Name]
+		state := old
+		if supported {
+			state.Ping = true
+		} else {
+			state.LastUnsupported = now
+		}
+		s.pollFeatures[res.Name] = state
+		// Persist only what changes the gate: support appearing, or a legacy
+		// poll after a quiet spell. Every poll hitting the database would put
+		// a write on the hot path.
+		persist := state.Ping != old.Ping || (!supported && (old.LastUnsupported.IsZero() || now.Sub(old.LastUnsupported) > pollFeaturesPersistEvery))
+		s.mu.Unlock()
+		if persist {
+			encoded, _ := json.Marshal(state)
+			if err := s.store.SetPollFeatures(r.Context(), res.Name, string(encoded)); err != nil {
+				log.Printf("poll features: %v", err)
+			}
+		}
+	}
 	return res.Name
 }
 
-// seen records that agent called the relay. The in-memory time moves on
-// every call; the store is written at most once per persistEvery so that
-// activity survives a restart without a write per request. A failed write is
+// seen records that agent called the relay, running the tincan build named
+// by version ("" from a client that predates the header). The in-memory
+// time moves on every call; the store is written at most once per
+// persistEvery so that activity survives a restart without a write per
+// request. The build is written only when it changes, so an upgrade shows in
+// the roster at once and an unchanged one costs nothing. A failed write is
 // logged and never fails the request.
-func (s *Server) seen(ctx context.Context, agent string) {
+func (s *Server) seen(ctx context.Context, agent, version string) {
 	now := s.cfg.Now()
+	version = cleanVersion(version)
 	s.mu.Lock()
 	if now.After(s.lastSeen[agent]) {
 		s.lastSeen[agent] = now
@@ -306,14 +513,30 @@ func (s *Server) seen(ctx context.Context, agent string) {
 	if write {
 		s.persisted[agent] = now
 	}
+	if version != "" {
+		s.versions[agent] = version
+	}
+	vw, wrote := s.versionWritten[agent]
+	writeVersion := version != "" && s.storedVersion[agent] != version && (!wrote || now.Sub(vw) >= persistEvery)
+	if writeVersion {
+		s.storedVersion[agent] = version
+		s.versionWritten[agent] = now
+	}
 	s.mu.Unlock()
-	if !write {
+	if !write && !writeVersion {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := s.store.TouchAgent(ctx, agent, now); err != nil {
-		log.Printf("last seen for %s: %v", agent, err)
+	if write {
+		if err := s.store.TouchAgent(ctx, agent, now); err != nil {
+			log.Printf("last seen for %s: %v", agent, err)
+		}
+	}
+	if writeVersion {
+		if err := s.store.SetAgentVersion(ctx, agent, version); err != nil {
+			log.Printf("version for %s: %v", agent, err)
+		}
 	}
 }
 
@@ -329,7 +552,14 @@ func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"name": name, "kind": a.Kind, "relay_key": s.key, "relay_urls": s.urls})
+	out := map[string]any{"name": name, "kind": a.Kind, "relay_key": s.key, "relay_urls": s.urls}
+	if s.cfg.Version != "" {
+		out["relay_version"] = s.cfg.Version
+	}
+	if v := s.upgradeFor(r); v != "" {
+		out["upgrade_available"] = v
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
@@ -355,14 +585,41 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, errors.New("no such agent: "+req.To))
 		return
 	}
+	if req.Kind == envelope.KindPing {
+		s.mu.Lock()
+		state := s.pollFeatures[req.To]
+		capable, version := state.Ping && (state.LastUnsupported.IsZero() || s.cfg.Now().Sub(state.LastUnsupported) > legacyPollWindow), s.versions[req.To]
+		s.mu.Unlock()
+		if !capable {
+			if version == "" {
+				version = "unknown"
+			}
+			writeErr(w, http.StatusConflict, fmt.Errorf("%s runs tincan %s and has not advertised ping support; use ask", req.To, version))
+			return
+		}
+	}
 	if err := s.prep.Prepare(r.Context(), &req); err != nil {
 		s.record(r.Context(), "rejected", "", req.TraceID, from, store.DetailJSON(map[string]any{"to": req.To, "reason": err.Error()}))
 		writeErr(w, statusFor(err), err)
 		return
 	}
-	req, err = s.store.Enqueue(r.Context(), req, s.cfg.RequestTTL)
+	prepared := req
+	req, err = s.store.Enqueue(r.Context(), req, s.requestTTL(r.Context(), req.To))
 	if err != nil {
+		if rf, ok := s.prep.(Refunder); ok {
+			rf.Refund(prepared)
+		}
+		if errors.Is(err, store.ErrGroupFull) {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
 		writeErr(w, attachmentStatus(err, http.StatusInternalServerError), err)
+		return
+	}
+	if req.Status == envelope.StatusHeld {
+		s.record(r.Context(), "held", req.ID, req.TraceID, from, store.DetailJSON(map[string]any{"to": req.To, "hop": req.Hop, "chain": req.Chain}))
+		s.notifyApproval(r.Context(), req)
+		writeJSON(w, http.StatusCreated, req)
 		return
 	}
 	s.hub.notify(inboxKey(req.To))
@@ -370,7 +627,28 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if s.events != nil {
 		s.events.Queued(r.Context(), req)
 	}
-	writeJSON(w, http.StatusCreated, req)
+	writeJSON(w, http.StatusCreated, envelope.SendResponse{Request: req, Target: s.recipientTarget(r.Context(), req.To)})
+}
+
+// recipientTarget is the schedule facts for agent, nil unless it is on
+// wake method schedule. A failed join-time lookup measures from the
+// relay's start.
+func (s *Server) recipientTarget(ctx context.Context, agent string) *envelope.Target {
+	every := s.checkEvery(agent)
+	if every <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	last := s.lastPoll[agent]
+	s.mu.Unlock()
+	var joined time.Time
+	if last.IsZero() {
+		// Only an agent that has never polled is measured from its join.
+		if a, ok, err := s.lookupAgent(ctx, agent); err == nil && ok {
+			joined = a.JoinedAt
+		}
+	}
+	return s.scheduleTarget(every, last, joined, s.cfg.Now())
 }
 
 // handlePoll holds a long-poll until requests for the caller, or unseen
@@ -425,14 +703,25 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			// Report what is waiting without delivering it, so a listener
 			// can nudge the agent and the agent's own check_inbox still
 			// receives it. waiting counts the replies it was asked for.
-			n, err := s.store.CountQueued(r.Context(), name)
+			n, pings, err := s.store.CountQueuedWithPings(r.Context(), name)
 			if err != nil {
 				writeErr(w, http.StatusInternalServerError, err)
 				return
 			}
 			if n > 0 || len(reps) > 0 {
 				out := map[string]any{"waiting": n + len(reps) + more, "queued": n}
+				if pings > 0 {
+					out["pings"] = pings
+				}
 				if n > 0 {
+					urgent, err := s.store.CountUrgentQueued(r.Context(), name)
+					if err != nil {
+						writeErr(w, http.StatusInternalServerError, err)
+						return
+					}
+					if urgent > 0 {
+						out["urgent"] = urgent
+					}
 					pending, err := s.store.PendingRequests(r.Context(), name, MaxPeekPending)
 					if err != nil {
 						writeErr(w, http.StatusInternalServerError, err)
@@ -446,6 +735,9 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 				if more > 0 {
 					out["replies_remaining"] = more
 				}
+				if v := s.upgradeFor(r); v != "" {
+					out["upgrade_available"] = v
+				}
 				writeJSON(w, http.StatusOK, out)
 				return
 			}
@@ -453,11 +745,18 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			case <-wake:
 				continue
 			case <-deadline.C:
-				w.WriteHeader(http.StatusNoContent)
-				return
+			case <-s.stopping:
 			case <-r.Context().Done():
 				return
 			}
+			if v := s.upgradeFor(r); v != "" {
+				out := map[string]any{"upgrade_available": v}
+				out["waiting"], out["queued"] = 0, 0
+				writeJSON(w, http.StatusOK, out)
+			} else {
+				w.WriteHeader(http.StatusNoContent)
+			}
+			return
 		}
 		reqs, err := s.store.Deliver(r.Context(), name, 20, s.cfg.DeliveryLease)
 		if err != nil {
@@ -465,6 +764,9 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(reqs) > 0 || len(reps) > 0 {
+			for i := range reqs {
+				reqs[i].RedactFor(name)
+			}
 			for _, q := range reqs {
 				s.record(r.Context(), "delivered", q.ID, q.TraceID, name, "")
 			}
@@ -475,23 +777,35 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			if more > 0 {
 				out["replies_remaining"] = more
 			}
+			if v := s.upgradeFor(r); v != "" {
+				out["upgrade_available"] = v
+			}
 			writeJSON(w, http.StatusOK, out)
 			return
 		}
 		select {
 		case <-wake:
+			continue
 		case <-deadline.C:
-			s.touch(name)
-			w.WriteHeader(http.StatusNoContent)
-			return
+		case <-s.stopping:
 		case <-r.Context().Done():
 			return
 		}
+		s.touch(name)
+		if v := s.upgradeFor(r); v != "" {
+			out := map[string]any{"upgrade_available": v}
+			out["requests"] = []envelope.Request{}
+			writeJSON(w, http.StatusOK, out)
+		} else {
+			w.WriteHeader(http.StatusNoContent)
+		}
+		return
 	}
 }
 
-// MaxPeekPending caps how many queued requests one peek names. queued still
-// counts them all.
+// MaxPeekPending caps how many queued requests one peek names, with a
+// separate cap for pings, which are listed first. queued still counts them
+// all.
 const MaxPeekPending = 50
 
 // MaxRepliesBytes bounds the request, reply, and parent bodies of the unseen replies
@@ -511,6 +825,12 @@ func (s *Server) unseenReplies(ctx context.Context, agent string) ([]envelope.Re
 	size := 0
 	for i, rep := range reps {
 		n := len(rep.Request.Body)
+		for _, ex := range rep.Exchanges {
+			n += len(ex.Question) + len(ex.Answer)
+		}
+		for _, ex := range rep.Request.Exchanges {
+			n += len(ex.Question) + len(ex.Answer)
+		}
 		if rep.Reply != nil {
 			n += len(rep.Reply.Body)
 		}
@@ -542,17 +862,18 @@ func (s *Server) handleAckReplies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		IDs []string `json:"ids"`
+		IDs  []string            `json:"ids"`
+		Acks []envelope.ReplyAck `json:"acks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("body must be {\"ids\": [...]}: %w", err))
 		return
 	}
-	if len(in.IDs) > maxAckIDs {
+	if len(in.IDs)+len(in.Acks) > maxAckIDs {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("at most %d ids per ack", maxAckIDs))
 		return
 	}
-	if err := s.store.MarkRepliesSeen(r.Context(), name, in.IDs); err != nil {
+	if err := s.store.MarkRepliesSeen(r.Context(), name, in.IDs, in.Acks...); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -575,14 +896,87 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		return
 	}
-	req, err := s.store.Claim(r.Context(), r.PathValue("id"), name, s.cfg.ClaimLease)
+	var in struct {
+		TaskID    string `json:"task_id"`
+		AttemptID string `json:"attempt_id"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil && err != io.EOF {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid claim body"))
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		writeErr(w, http.StatusBadRequest, errors.New("claim requires one JSON object"))
+		return
+	}
+	var req envelope.Request
+	var err error
+	if in.TaskID != "" || in.AttemptID != "" {
+		a, _ := r.Context().Value(authenticatedActorKey{}).(authenticatedActor)
+		owner := envelope.ClaimOwnership{TaskID: in.TaskID, AttemptID: in.AttemptID, ActorID: a.ID}
+		if !store.ValidClaimOwner(owner, false) {
+			writeErr(w, http.StatusBadRequest, errors.New("task_id and attempt_id are required bounded identifiers"))
+			return
+		}
+		req, err = s.store.ClaimOwned(r.Context(), r.PathValue("id"), name, owner, s.cfg.ClaimLease)
+	} else if slices.Contains(s.cfg.RequireClaimOwnership, name) {
+		err = store.ErrClaimConflict
+	} else {
+		current, _, lookupErr := s.store.Request(r.Context(), r.PathValue("id"))
+		if lookupErr == nil && current.Ownership != nil {
+			err = store.ErrClaimConflict
+		} else {
+			req, err = s.store.Claim(r.Context(), r.PathValue("id"), name, s.cfg.ClaimLease)
+		}
+	}
 	if err != nil {
 		writeErr(w, statusFor(err), err)
 		return
 	}
 	s.hub.notify(requestKey(req.ID))
-	s.record(r.Context(), "claimed", req.ID, req.TraceID, name, "")
+	if req.Ownership == nil {
+		s.record(r.Context(), "claimed", req.ID, req.TraceID, name, "")
+	}
 	writeJSON(w, http.StatusOK, req)
+}
+
+func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
+	name := s.agent(w, r)
+	if name == "" {
+		return
+	}
+	var in struct {
+		Note string `json:"note"`
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, err)
+		return
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid progress body"))
+		return
+	}
+	if len(in.Note) > envelope.MaxProgressNote {
+		writeErr(w, http.StatusRequestEntityTooLarge, envelope.ErrBodyTooLarge)
+		return
+	}
+	if strings.TrimSpace(in.Note) == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("note is required"))
+		return
+	}
+	if !s.operationOwner(w, r, name, raw) {
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.store.SetProgress(r.Context(), id, name, in.Note, s.cfg.ClaimLease); err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	s.record(r.Context(), "progress", id, "", name, store.DetailJSON(map[string]any{"bytes": len(in.Note)}))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
@@ -604,6 +998,9 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errAttachmentsOff)
 		return
 	}
+	if !s.operationOwner(w, r, name, raw) {
+		return
+	}
 	id := r.PathValue("id")
 	rep, err = s.store.Reply(r.Context(), id, name, rep)
 	if err != nil {
@@ -611,12 +1008,20 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.hub.notify(requestKey(id))
-	s.record(r.Context(), "replied", id, "", name, store.DetailJSON(map[string]any{"status": rep.Status}))
+	event := "replied"
+	detail := map[string]any{"status": rep.Status}
+	if rep.Status == envelope.StatusNeedsInput {
+		event = "needs_input"
+		detail = map[string]any{"question_bytes": len(rep.Body)}
+	}
+	if _, owned := r.Context().Value(authenticatedOwnershipKey{}).(bool); !owned {
+		s.record(r.Context(), event, id, "", name, store.DetailJSON(detail))
+	}
 	// The asker learns of the reply from a held poll now, or from a wake
 	// once the waker's grace period shows it went unread.
 	if req, _, err := s.store.Request(r.Context(), id); err == nil {
 		s.hub.notify(inboxKey(req.From))
-		if rp, ok := s.events.(Replier); ok {
+		if rp, ok := s.events.(Replier); ok && req.Kind != envelope.KindPing {
 			rp.Replied(r.Context(), req)
 		}
 	} else {
@@ -641,18 +1046,25 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, statusFor(err), err)
 			return
 		}
-		if res.Done() || wait == 0 {
+		if res.Done() || res.Status == envelope.StatusNeedsInput || res.Status == envelope.StatusHeld || wait == 0 {
 			writeJSON(w, http.StatusOK, res)
 			return
 		}
 		select {
 		case <-wake:
+			continue
 		case <-deadline.C:
-			writeJSON(w, http.StatusOK, res)
-			return
+		case <-s.stopping:
 		case <-r.Context().Done():
 			return
 		}
+		res, err = s.store.Get(r.Context(), id, name)
+		if err != nil {
+			writeErr(w, statusFor(err), err)
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+		return
 	}
 }
 
@@ -674,8 +1086,51 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 // WakeNamer reports an agent's wake method name. Set by package wake.
 type WakeNamer interface{ WakeMethod(agent string) string }
 
-// SetWakeNamer installs the wake method lookup for the agent list.
+// SetWakeNamer installs the wake method lookup for the agent list. If w
+// also implements Scheduler, schedule agents' facts are reported too.
 func (s *Server) SetWakeNamer(w WakeNamer) { s.wake = w }
+
+// Scheduler reports how often an agent on wake method schedule checks its
+// inbox, 0 for an agent on any other method. Set by package wake.
+type Scheduler interface {
+	CheckEvery(agent string) time.Duration
+}
+
+// ScheduleGrace is the allowance for a schedule agent's late check: the
+// reply window a sender is shown is one interval plus it, and an agent is
+// overdue after two intervals plus it without polling.
+const ScheduleGrace = 5 * time.Minute
+
+// checkEvery is agent's schedule interval, 0 when it is not on schedule.
+func (s *Server) checkEvery(agent string) time.Duration {
+	if sc, ok := s.wake.(Scheduler); ok {
+		return sc.CheckEvery(agent)
+	}
+	return 0
+}
+
+// scheduleTarget computes a schedule agent's facts from its interval and
+// its last inbox poll. An agent that has not polled since the relay
+// started is measured from the later of its join and the relay's start.
+// Other activity, such as sending asks, does not count as checking. Nil
+// when every is not positive.
+func (s *Server) scheduleTarget(every time.Duration, lastPoll, joined, now time.Time) *envelope.Target {
+	if every <= 0 {
+		return nil
+	}
+	since := lastPoll
+	if since.IsZero() {
+		since = joined
+		if s.started.After(since) {
+			since = s.started
+		}
+	}
+	return &envelope.Target{
+		CheckEverySeconds:  int(every / time.Second),
+		ExpectReplySeconds: int((every + ScheduleGrace) / time.Second),
+		Overdue:            now.Sub(since) > 2*every+ScheduleGrace,
+	}
+}
 
 // handleAgents lists the roster for joined agents and for admin devices,
 // which need not be joined (onboarding runs from an admin laptop).
@@ -693,6 +1148,10 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		// The in-memory times still answer for this run of the relay.
 		log.Printf("agents last seen: %v", err)
 	}
+	stats, err := s.store.QueueStats(r.Context())
+	if err != nil {
+		log.Printf("agents queue stats: %v", err)
+	}
 	now := s.cfg.Now()
 	out := make([]client.AgentInfo, 0, len(agents))
 	s.mu.Lock()
@@ -702,14 +1161,26 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		if p := persisted[a.Name]; p.After(active) {
 			active = p
 		}
-		info := client.AgentInfo{Name: a.Name, LastPoll: last, LastActive: active, Online: !last.IsZero() && now.Sub(last) < s.cfg.PollHold+30*time.Second, Wake: "none", Kind: a.Kind}
+		info := client.AgentInfo{Name: a.Name, LastPoll: last, LastActive: active, Online: !last.IsZero() && now.Sub(last) < s.cfg.PollHold+30*time.Second, Wake: "none", Kind: a.Kind, GoodAt: a.GoodAt, Version: s.versions[a.Name]}
+		if info.GoodAt == "" {
+			info.GoodAt = onboard.StockGoodAt(a.Kind)
+		}
+		stat := stats[a.Name]
+		info.Queued, info.OldestQueued, info.Claimed = stat.Queued, stat.OldestQueued, stat.Claimed
 		if s.wake != nil {
 			info.Wake = s.wake.WakeMethod(a.Name)
+			if t := s.scheduleTarget(s.checkEvery(a.Name), last, a.JoinedAt, now); t != nil {
+				info.Target = *t
+			}
 		}
 		out = append(out, info)
 	}
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"agents": out})
+	res := map[string]any{"agents": out}
+	if s.cfg.Version != "" {
+		res["relay_version"] = s.cfg.Version
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
@@ -777,6 +1248,36 @@ func (s *Server) handleSetKind(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"name": name, "kind": in.Kind})
 }
 
+// handleSetGoodAt records the owner's line saying what a joined agent is good
+// at (admin only). An empty line clears it, so a fixed-job kind shows its
+// stock line again; a body without good_at is refused rather than read as a
+// clear.
+func (s *Server) handleSetGoodAt(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		GoodAt *string `json:"good_at"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if in.GoodAt == nil {
+		writeErr(w, http.StatusBadRequest, errors.New(`good_at is required; send "" to clear the line`))
+		return
+	}
+	if !s.isAdmin(r) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	name := r.PathValue("name")
+	line, err := s.dir.SetGoodAt(r.Context(), s.remote(r), name, *in.GoodAt)
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	s.record(r.Context(), "good-at", "", "", name, store.DetailJSON(map[string]any{"good_at": line}))
+	writeJSON(w, http.StatusOK, map[string]string{"name": name, "good_at": line})
+}
+
 // knownKind accepts "" and the kinds onboarding can tailor a block to, so a
 // typo is caught when it is set rather than silently ignored later.
 func knownKind(kind string) error {
@@ -826,6 +1327,17 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, statusFor(err), err)
 		return
 	}
+	// What the relay remembered about the name in memory goes with it, so
+	// an agent joined later under the same name starts with a clean row.
+	s.mu.Lock()
+	delete(s.lastPoll, in.Name)
+	delete(s.lastSeen, in.Name)
+	delete(s.persisted, in.Name)
+	delete(s.versions, in.Name)
+	delete(s.pollFeatures, in.Name)
+	delete(s.storedVersion, in.Name)
+	delete(s.versionWritten, in.Name)
+	s.mu.Unlock()
 	s.record(r.Context(), "removed", "", "", in.Name, store.DetailJSON(map[string]any{"cancelled": len(ids)}))
 	writeJSON(w, http.StatusOK, map[string]any{"removed": in.Name, "cancelled": len(ids)})
 }
@@ -838,6 +1350,16 @@ func (s *Server) isAgent(ctx context.Context, name string) bool {
 // record appends an audit entry. Audit failures are logged, never fatal: the
 // relay keeps delivering if the log cannot be written.
 func (s *Server) record(ctx context.Context, event, requestID, traceID, actor, detail string) {
+	owned, _ := ctx.Value(authenticatedOwnershipKey{}).(bool)
+	if auth, ok := ctx.Value(authenticatedActorKey{}).(authenticatedActor); ok && (auth.ServiceRole || owned) {
+		fields := map[string]any{}
+		if detail != "" {
+			_ = json.Unmarshal([]byte(detail), &fields)
+		}
+		fields["agent"] = auth.Name
+		detail = store.DetailJSON(fields)
+		actor = auth.ID
+	}
 	if traceID == "" && requestID != "" {
 		if req, _, err := s.store.Request(ctx, requestID); err == nil {
 			traceID = req.TraceID
@@ -858,6 +1380,21 @@ func (s *Server) Online(agent string) bool {
 	}
 	last := s.lastPoll[agent]
 	return !last.IsZero() && s.cfg.Now().Sub(last) < 5*time.Second
+}
+
+// QueuedCount returns how many requests to agent are still waiting to be
+// delivered. The waker asks this when it re-checks a wake it skipped because
+// agent looked online. A failed count reports one, since a spare nudge costs
+// less than a stranded request.
+func (s *Server) QueuedCount(agent string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n, err := s.store.CountQueued(ctx, agent)
+	if err != nil {
+		log.Printf("queued requests for %s: %v", agent, err)
+		return 1
+	}
+	return n
 }
 
 // UnseenReplies returns how many replies to agent's own requests it has not
@@ -921,7 +1458,7 @@ func statusFor(err error) int {
 	case errors.Is(err, store.ErrForbidden), errors.Is(err, identity.ErrNotAdmin), errors.Is(err, identity.ErrNotJoined),
 		errors.Is(err, identity.ErrAgentAmbiguous):
 		return http.StatusForbidden
-	case errors.Is(err, store.ErrWrongState):
+	case errors.Is(err, store.ErrWrongState), errors.Is(err, store.ErrClaimConflict):
 		return http.StatusConflict
 	case errors.Is(err, identity.ErrBadInvite):
 		return http.StatusBadRequest
@@ -959,6 +1496,9 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		if name == "" {
 			return
 		}
+		for i := range steps {
+			steps[i].Request.RedactFor(name)
+		}
 		if !slices.Contains(store.Participants(steps), name) {
 			writeErr(w, http.StatusNotFound, errors.New("no such trace"))
 			return
@@ -985,7 +1525,7 @@ func (s *Server) handleRecent(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n <= 200 {
 		limit = n
 	}
-	steps, err := s.store.RecentTraces(r.Context(), limit)
+	steps, err := s.store.RecentTraces(r.Context(), limit, r.URL.Query().Get("exclude_pings") == "true")
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -1029,4 +1569,192 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	s.record(r.Context(), "connected", "", "", in.Name, "")
 	writeJSON(w, http.StatusOK, map[string]string{"name": in.Name, "code": code, "url": url, "expires_in": "10m0s"})
+}
+
+func approvalPreview(body string) string {
+	return string([]rune(body)[:min(200, len([]rune(body)))])
+}
+
+func (s *Server) handleHeld(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	s.Sweep(r.Context())
+	reqs, err := s.store.Held(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Each entry also names the target's kind, so the owner sees a council ask
+	// (which goes on to every model vendor) for what it is. The attachments'
+	// names and sizes already ride on the request. Old clients ignore to_kind.
+	type heldRequest struct {
+		envelope.Request
+		ToKind string `json:"to_kind,omitempty"`
+	}
+	out := make([]heldRequest, len(reqs))
+	kinds := map[string]string{} // target -> kind, for the lookups that succeeded
+	for i, req := range reqs {
+		req.Body = approvalPreview(req.Body)
+		out[i] = heldRequest{Request: req}
+		kind, seen := kinds[req.To]
+		if !seen {
+			a, ok, err := s.lookupAgent(r.Context(), req.To)
+			if err != nil {
+				continue
+			}
+			if ok {
+				kind = a.Kind
+			}
+			kinds[req.To] = kind
+		}
+		out[i].ToKind = kind
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	s.Sweep(r.Context())
+	id := r.PathValue("id")
+	ttl := s.cfg.RequestTTL
+	if held, _, err := s.store.Request(r.Context(), id); err == nil {
+		ttl = s.requestTTL(r.Context(), held.To)
+	}
+	req, err := s.store.Release(r.Context(), id, ttl)
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	s.record(r.Context(), "approved", req.ID, req.TraceID, s.remote(r), "")
+	s.hub.notify(requestKey(req.ID))
+	s.hub.notify(inboxKey(req.To))
+	if s.events != nil {
+		s.events.Queued(r.Context(), req)
+	}
+	writeJSON(w, http.StatusOK, req)
+}
+
+func (s *Server) handleDeny(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(r) {
+		writeErr(w, http.StatusForbidden, identity.ErrNotAdmin)
+		return
+	}
+	var in struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, envelope.DefaultMaxBody+1024)).Decode(&in); err != nil && err != io.EOF {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(in.Reason) > envelope.DefaultMaxBody {
+		writeErr(w, http.StatusBadRequest, envelope.ErrBodyTooLarge)
+		return
+	}
+	s.Sweep(r.Context())
+	req, err := s.store.DenyHeld(r.Context(), r.PathValue("id"), in.Reason)
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	s.record(r.Context(), "denied", req.ID, req.TraceID, s.remote(r), "")
+	s.hub.notify(requestKey(req.ID))
+	s.hub.notify(inboxKey(req.From))
+	if replier, ok := s.events.(Replier); ok {
+		replier.Replied(r.Context(), req)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "declined"})
+}
+
+// requestTTL is how long a request to agent lives unanswered: notes agents
+// get NotesRequestTTL so an add survives the notes Mac being offline for
+// days; every other kind, and an unknown agent, gets RequestTTL. A failed
+// lookup is logged and gets NotesRequestTTL: keeping a non-notes request
+// longer than needed is cheaper than expiring a note after a day.
+func (s *Server) requestTTL(ctx context.Context, agent string) time.Duration {
+	a, ok, err := s.lookupAgent(ctx, agent)
+	if err != nil {
+		log.Printf("request ttl: look up %s: %v (using notes ttl %v)", agent, err, s.cfg.NotesRequestTTL)
+		return s.cfg.NotesRequestTTL
+	}
+	if ok && a.Kind == onboard.KindNotes {
+		return s.cfg.NotesRequestTTL
+	}
+	return s.cfg.RequestTTL
+}
+
+func (s *Server) notifyApproval(ctx context.Context, held envelope.Request) {
+	if held.ApprovalNotify == "" {
+		return
+	}
+	if !s.isAgent(ctx, held.ApprovalNotify) {
+		s.record(ctx, "approval_notify_failed", held.ID, held.TraceID, "relay", "notify agent is not joined")
+		return
+	}
+	// This is a relay admin notice, not a forwarded agent request. It bypasses
+	// the gate to avoid recursive notices, and grants no approval capability.
+	// It carries no request text: the notified agent may itself be gated (even
+	// the held target), and unapproved text must not reach it. The owner reads
+	// the request with tincan held.
+	req := envelope.Request{From: "relay", To: held.ApprovalNotify, Kind: envelope.KindNotify, Hop: 1, Chain: []string{"relay"},
+		Body: fmt.Sprintf("held for approval: %s -> %s (request %s). Owner: see it with tincan held, then run tincan approve %s or tincan deny %s. Only the owner may decide.", held.From, held.To, held.ID, held.ID, held.ID)}
+	req, err := s.store.Enqueue(ctx, req, s.requestTTL(ctx, req.To))
+	if err != nil {
+		s.record(ctx, "approval_notify_failed", held.ID, held.TraceID, "relay", "")
+		return
+	}
+	s.record(ctx, "approval_notified", held.ID, held.TraceID, "relay", store.DetailJSON(map[string]any{"notification_id": req.ID, "to": req.To}))
+	s.record(ctx, "queued", req.ID, req.TraceID, "relay", store.DetailJSON(map[string]any{"held_id": held.ID, "to": req.To}))
+	s.hub.notify(inboxKey(req.To))
+	if s.events != nil {
+		s.events.Queued(ctx, req)
+	}
+}
+
+// Never-approved attachments remain private even after the hold ends.
+func (s *Server) handleApprovalFetch(w http.ResponseWriter, r *http.Request) {
+	rec, err := s.store.Attachment(r.Context(), r.PathValue("id"))
+	if err == nil && rec.RequestID != "" {
+		req, _, err := s.store.Request(r.Context(), rec.RequestID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if req.WasHeld && !req.Approved && !s.isAdmin(r) {
+			name := s.agent(w, r)
+			if name == "" {
+				return
+			}
+			if name != req.From {
+				writeErr(w, http.StatusNotFound, store.ErrNotFound)
+				return
+			}
+		}
+	}
+	s.handleFetch(w, r)
+}
+
+func (s *Server) handleGroup(w http.ResponseWriter, r *http.Request) {
+	name := s.agent(w, r)
+	if name == "" {
+		return
+	}
+	reqs, err := s.store.RequestsByGroup(r.Context(), name, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	if len(reqs) == 0 {
+		writeErr(w, http.StatusNotFound, store.ErrNotFound)
+		return
+	}
+	members := make([]envelope.GroupMember, 0, len(reqs))
+	for _, req := range reqs {
+		members = append(members, envelope.GroupMember{ID: req.ID, To: req.To})
+	}
+	writeJSON(w, http.StatusOK, members)
 }

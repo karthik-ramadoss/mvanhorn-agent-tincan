@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/history"
 )
 
@@ -91,9 +92,9 @@ func TestHistoryListText(t *testing.T) {
 func TestHistorySearchWritesImages(t *testing.T) {
 	historyEnv(t)
 	dir := filepath.Join(t.TempDir(), "imgs")
-	out, err := run(t, Root(), "history", "codex", "--search", "fox logo", "--images-dir", dir, "--json")
+	out, stderr, err := runSplit(t, Root(), "history", "codex", "--search", "fox logo", "--images-dir", dir, "--json")
 	if err != nil {
-		t.Fatalf("%v\n%s", err, out)
+		t.Fatalf("%v\n%s%s", err, out, stderr)
 	}
 	var convs []history.Conversation
 	if err := json.Unmarshal([]byte(out), &convs); err != nil {
@@ -136,6 +137,35 @@ func TestHistoryClaudeCodeSearchAndID(t *testing.T) {
 	}
 }
 
+// tincan history grok-cli reads the owner's $GROK_HOME and leaves out the
+// runs a grok-cli wake recorded beside its tincan config, unless --all.
+func TestHistoryGrokCLI(t *testing.T) {
+	historyEnv(t)
+	base := t.TempDir()
+	grokHome := filepath.Join(base, "grok")
+	if err := os.CopyFS(grokHome, os.DirFS("../history/testdata/grok-cli")); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(base, "home")
+	if err := os.CopyFS(filepath.Join(home, ".config", "tincan"), os.DirFS("../history/testdata/grok-cli/tincan")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	t.Setenv("HOME", home)
+	out, err := run(t, Root(), "history", "grok-cli")
+	if err != nil || !strings.Contains(out, "does this diagram match") || !strings.Contains(out, "Parser refactor plan") {
+		t.Fatalf("latest: %v\n%s", err, out)
+	}
+	out, err = run(t, Root(), "history", "grok-cli", "--list", "10")
+	if err != nil || strings.Contains(out, "01a0f000-0000-7000-8000-000000000003") || strings.Contains(out, "01a0f000-0000-7000-8000-000000000005") {
+		t.Fatalf("list: %v\n%s", err, out)
+	}
+	out, err = run(t, Root(), "history", "grok-cli", "--list", "10", "--all")
+	if err != nil || !strings.Contains(out, "01a0f000-0000-7000-8000-000000000003") || !strings.Contains(out, "01a0f000-0000-7000-8000-000000000004") {
+		t.Fatalf("list --all: %v\n%s", err, out)
+	}
+}
+
 func TestHistoryBadArgs(t *testing.T) {
 	historyEnv(t)
 	cases := [][]string{
@@ -144,11 +174,140 @@ func TestHistoryBadArgs(t *testing.T) {
 		{"history", "codex", "--latest", "--search", "fox"},
 		{"history", "codex", "--id", "../../etc"},
 		{"history", "codex", "--list", "0"},
+		{"history", "codex", "--max", "0"},
+		{"history", "codex", "--max", "201"},
+		{"history", "codex", "--days", "0"},
+		{"history", "codex", "--days", "3651"},
 	}
 	for _, args := range cases {
 		if out, err := run(t, Root(), args...); err == nil {
 			t.Errorf("%v: want error, got output:\n%s", args, out)
 		}
+	}
+}
+
+// Perplexity fronts a web agent only: it is not a history source.
+func TestHistoryPerplexityIsUnknownSource(t *testing.T) {
+	historyEnv(t)
+	_, err := run(t, Root(), "history", "perplexity")
+	if err == nil || !strings.Contains(err.Error(), `unknown history source "perplexity"`) || strings.Contains(err.Error(), "perplexity or") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// ageMascot makes the fixture's "Old mascot" Codex thread 60 days old.
+func ageMascot(t *testing.T, codexHome string) {
+	t.Helper()
+	p := filepath.Join(codexHome, "session_index.jsonl")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = bytes.ReplaceAll(b, []byte("2026-08-20T09:00:05"), []byte("2026-07-24T09:00:05"))
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHistoryDaysWidensTheWindowAndLimitsAreNoted(t *testing.T) {
+	codexHome, _ := historyEnv(t)
+	ageMascot(t, codexHome)
+	out, err := run(t, Root(), "history", "codex", "--search", "mascot")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if strings.Contains(out, "Old mascot") || !strings.Contains(out, "Nothing found.") {
+		t.Fatalf("the default 30 days found a 60 day old thread:\n%s", out)
+	}
+	if !strings.Contains(out, "only conversations from the last 30 days were read") || !strings.Contains(out, "--days") {
+		t.Fatalf("no limit note for an age-limited search:\n%s", out)
+	}
+	out, err = run(t, Root(), "history", "codex", "--search", "mascot", "--days", "90")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Old mascot") {
+		t.Fatalf("--days 90 missed the 60 day old thread:\n%s", out)
+	}
+	if strings.Contains(out, "were read") {
+		t.Fatalf("a complete answer carries a limit note:\n%s", out)
+	}
+	// A search cut short by --max names that limit.
+	out, err = run(t, Root(), "history", "codex", "--search", "mascot", "--days", "90", "--max", "1")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if !strings.Contains(out, "only the last 1 conversations were read") || !strings.Contains(out, "--max") {
+		t.Fatalf("no count note:\n%s", out)
+	}
+	// --days reaches --list too.
+	out, err = run(t, Root(), "history", "codex", "--list", "20", "--days", "90")
+	if err != nil || !strings.Contains(out, "Old mascot") {
+		t.Fatalf("--list with --days 90: %v\n%s", err, out)
+	}
+}
+
+// limitNote suggests --max only when a larger --max could read more, and
+// phrases a listing and a one day window on their own terms.
+func TestLimitNote(t *testing.T) {
+	const prefix = "tincan history: results may be incomplete: "
+	day := 24 * time.Hour
+	count := func(maxConvs int) history.Page {
+		return history.Page{Limited: history.LimitCount, Window: history.Window{Max: maxConvs, MaxAge: 30 * day}}
+	}
+	for _, tc := range []struct {
+		name    string
+		page    history.Page
+		source  history.Source
+		listing bool
+		want    string
+	}{
+		{"complete", history.Page{Window: history.Window{Max: 50, MaxAge: 30 * day}}, history.SourceCodex, false, ""},
+		{"local count can widen", count(50), history.SourceCodex, false,
+			prefix + "only the last 50 conversations were read (use --max to widen it)."},
+		{"local count at the max", count(history.MaxWindowMax), history.SourceClaudeCode, false,
+			prefix + "only the last 200 conversations were read (200 is the most --max allows)."},
+		{"live count can widen", count(50), history.SourceChatGPT, false,
+			prefix + "only the last 50 conversations were read (use --max to widen it)."},
+		{"chatgpt at the list cap", count(history.MaxListCount), history.SourceChatGPT, false,
+			prefix + "only the last 100 conversations were read (ChatGPT, claude.ai, Grok, Gemini and Copilot read at most 100)."},
+		{"claude.ai at the list cap", count(history.MaxListCount), history.SourceClaudeAI, false,
+			prefix + "only the last 100 conversations were read (ChatGPT, claude.ai, Grok, Gemini and Copilot read at most 100)."},
+		{"local source past the list cap", count(history.MaxListCount), history.SourceCodex, false,
+			prefix + "only the last 100 conversations were read (use --max to widen it)."},
+		{"listing", count(history.MaxListCount), history.SourceChatGPT, true,
+			prefix + "only the newest 100 conversations could be listed."},
+		{"age", history.Page{Limited: history.LimitAge, Window: history.Window{Max: 50, MaxAge: 30 * day}}, history.SourceCodex, false,
+			prefix + "only conversations from the last 30 days were read (use --days to widen it)."},
+		{"one day", history.Page{Limited: history.LimitAge, Window: history.Window{Max: 50, MaxAge: day}}, history.SourceChatGPT, true,
+			prefix + "only conversations from the last 1 day were read (use --days to widen it)."},
+	} {
+		if got := limitNote(tc.page, tc.source, tc.listing); got != tc.want {
+			t.Errorf("%s:\n got %q\nwant %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestHistoryJSONStaysABareArrayWithTheNoteOnStderr(t *testing.T) {
+	historyEnv(t)
+	stdout, stderr, err := runSplit(t, Root(), "history", "codex", "--search", "mascot", "--json")
+	if err != nil {
+		t.Fatalf("%v\n%s%s", err, stdout, stderr)
+	}
+	var convs []history.Conversation
+	if err := json.Unmarshal([]byte(stdout), &convs); err != nil || len(convs) != 0 {
+		t.Fatalf("stdout is not an empty JSON array: %v\n%s", err, stdout)
+	}
+	if strings.Contains(stdout, "were read") {
+		t.Fatalf("limit note on stdout:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "only conversations from the last 30 days were read") {
+		t.Fatalf("stderr missing the limit note: %q", stderr)
+	}
+	// A complete answer prints no note.
+	stdout, stderr, err = runSplit(t, Root(), "history", "codex", "--json")
+	if err != nil || stderr != "" {
+		t.Fatalf("latest: %v, stderr %q\n%s", err, stderr, stdout)
 	}
 }
 
@@ -370,5 +529,82 @@ func TestServeStartupLineDescribesAllowlist(t *testing.T) {
 				t.Errorf("%s with %s: output missing %q:\n%s", c.name, filepath.Base(allow), want, out)
 			}
 		}
+	}
+}
+
+// The history service's startup line says which window it reads with.
+func TestHistoryServeStartupLineDescribesWindow(t *testing.T) {
+	dir := t.TempDir()
+	allow := filepath.Join(dir, "allow.txt")
+	missing := filepath.Join(dir, "missing.json")
+	set := filepath.Join(dir, "window.json")
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(set, []byte(`{"days": 90, "max": 150}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte(`{"days": 0}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for file, want := range map[string]string{
+		missing: "window: the last 50 conversations, up to 30 days (default, no file at " + missing + ")",
+		set:     "window " + set + ": the last 150 conversations, up to 90 days (ChatGPT, claude.ai, Grok, Gemini and Copilot read at most 100)",
+		bad:     "window file " + bad + " is not valid",
+	} {
+		out := startupLine(t, "history", "history", "serve", "--allowlist", allow, "--window-file", file)
+		if !strings.Contains(out, want) {
+			t.Errorf("%s: output missing %q:\n%s", filepath.Base(file), want, out)
+		}
+	}
+}
+
+// A service is the only thing that ever runs as its agent, so it learns the
+// relay key itself, into its own --config file. The default config
+// (TINCAN_CONFIG, another agent's) is never written.
+func TestServeLearnsRelayKeyIntoItsOwnConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"history", []string{"history", "serve"}},
+		{"chatgpt-web", []string{"web", "serve", "--site", "chatgpt"}},
+		{"claude-web", []string{"web", "serve", "--site", "claude-ai"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			other := filepath.Join(t.TempDir(), "client.json")
+			t.Setenv("TINCAN_CONFIG", other)
+			t.Setenv("TINCAN_RELAY", "")
+			t.Setenv("TINCAN_PROXY", "")
+			// history serve checks the native-host manifest and web serve keeps
+			// its state under HOME, so neither touches the real one.
+			t.Setenv("HOME", t.TempDir())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/whoami" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"name": c.name, "relay_key": "k-" + c.name, "relay_urls": []string{"http://tincan-relay"}})
+					return
+				}
+				cancel()
+				http.Error(w, "stopping", http.StatusServiceUnavailable)
+			}))
+			t.Cleanup(srv.Close)
+			own := serveConfig(t, srv.URL, c.name)
+			cmd := Root()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(append(slices.Clone(c.args), "--config", own, "--allowlist", filepath.Join(t.TempDir(), "allow.txt")))
+			if err := cmd.ExecuteContext(ctx); err != nil {
+				t.Fatalf("%v: %v\n%s", c.args, err, out.String())
+			}
+			cfg, err := client.LoadConfigFrom(own)
+			if err != nil || cfg.Agent != c.name || cfg.RelayKey != "k-"+c.name || !slices.Equal(cfg.RelayURLs, []string{"http://tincan-relay"}) || cfg.RelayInfoAt.IsZero() {
+				t.Fatalf("own config after serve = %+v, %v", cfg, err)
+			}
+			if _, err := os.Stat(other); !os.IsNotExist(err) {
+				t.Fatalf("the default config was written: %v", err)
+			}
+		})
 	}
 }

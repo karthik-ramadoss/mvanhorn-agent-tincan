@@ -53,8 +53,10 @@ the tools can still run it from a shell.
 
 It checks, in order: the saved join, the relay, whether this binary is the
 relay's current release, a self-test of tincan mcp in both stdio framings,
-the MCP config entries that point at tincan, and whether the app has
-actually been starting tincan mcp (every tincan mcp records its launch).
+the MCP config entries that point at tincan, whether the app has
+actually been starting tincan mcp (every tincan mcp records its launch),
+and whether a running tincan mcp is on a different build than this
+binary, as after tincan upgrade until the app reloads it.
 
 Exit status is 1 when a check fails.`,
 		Args: cobra.NoArgs,
@@ -106,26 +108,40 @@ func runDoctor(ctx context.Context, exe string, extraConfigs []string) doctorRep
 			break
 		}
 		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		me, err := r.WhoAmI(cctx)
+		// whoami also says whether this relay hands out its key, which
+		// decides what a key missing from the saved config means below.
+		var me struct {
+			Name     string `json:"name"`
+			RelayKey string `json:"relay_key"`
+		}
+		err = r.Raw(cctx, "GET", "/v1/whoami", nil, &me)
 		cancel()
 		switch {
 		case client.IsNotJoined(err):
 			add(check{"relay", "fail", "the relay does not know this machine: " + err.Error(), "Run tincan rejoin. If it says the machine was never joined, ask the owner for an invite."})
-		case err != nil && cfg.RelayKey == "":
-			add(check{"relay", "fail", "cannot reach the relay at " + cfg.Relay + ": " + err.Error(), "Check that this machine is on the tailnet (tailscale status) and the relay is running. If the relay moved to a new address, run tincan rejoin --relay <new URL>; this config has no relay key, so tincan cannot find it by itself."})
 		case err != nil:
-			add(check{"relay", "fail", "cannot reach the relay at " + cfg.Relay + ", and no online tailnet peer proved it is this relay: " + err.Error(), "Check that this machine is on the tailnet (tailscale status) and the relay is running. A proxy-only sandbox cannot search the tailnet: run tincan rejoin --relay <new URL>."})
+			add(relayUnreachableCheck(cfg, r, err))
 		default:
 			joined = true
 			add(check{"relay", "ok", fmt.Sprintf("reachable at %s; this machine is agent %q", r.Base(), me.Name), ""})
 			client.LearnRelayKey(ctx, r)
-			if saved, _ := client.LoadConfig(); saved.RelayKey != "" {
+			saved, _ := client.LoadConfig()
+			switch {
+			case saved.RelayKey != "":
 				add(check{"relay moves", "ok", "the relay key is saved, so this agent finds the relay by itself if its address changes", ""})
 				if len(saved.RelayURLs) > 0 {
 					add(addressCheck(ctx, r, saved.RelayURLs))
 				}
-			} else {
+			case me.RelayKey == "":
 				add(check{"relay moves", "warn", "the relay did not hand out its key (relay older than 0.5.0-rc12), so this agent cannot find the relay by itself if its address changes", "Upgrade the relay, then run tincan doctor again."})
+			case os.Getenv("TINCAN_RELAY") != "":
+				// The client never writes a relay it was given by the
+				// environment back to the file, so the key is dropped.
+				add(check{"relay moves", "warn", "the relay hands out its key, but TINCAN_RELAY overrides the saved config, so the key is not saved and this agent cannot find the relay by itself if its address changes",
+					"Save the relay in " + client.ConfigPath() + " instead: run tincan rejoin --relay " + cfg.Relay + " with TINCAN_RELAY unset, and stop setting it."})
+			default:
+				add(check{"relay moves", "warn", "the relay hands out its key, but it could not be saved to " + client.ConfigPath(),
+					"Check that the file is writable and names the relay at " + r.Base() + ", then run tincan doctor again."})
 			}
 		}
 	}
@@ -147,11 +163,15 @@ func runDoctor(ctx context.Context, exe string, extraConfigs []string) doctorRep
 	add(configCheck(rep.Configs, exe))
 
 	// 5. Whether an app has been starting tincan mcp at all.
-	rep.Launches = mcpserver.ReadLaunches(mcpserver.LaunchDir(client.ConfigPath()))
+	launches := mcpserver.ReadLaunches(mcpserver.LaunchDir(client.ConfigPath()))
+	rep.Launches = launches
 	if len(rep.Launches) > 5 {
 		rep.Launches = rep.Launches[:5]
 	}
 	add(launchCheck(rep.Launches, time.Now()))
+
+	// 6. tincan mcp servers left on another build by an upgrade.
+	add(buildCheck(launches, mcpserver.LaunchRunning))
 
 	rep.OK = true
 	hostProblem := false
@@ -167,6 +187,29 @@ func runDoctor(ctx context.Context, exe string, extraConfigs []string) doctorRep
 		rep.Fix = hostFix(exe)
 	}
 	return rep
+}
+
+// relayUnreachableCheck explains a failed whoami: no key, an error that
+// set off no search, no local netmap, or a netmap whose peers did not prove
+// they are this relay.
+func relayUnreachableCheck(cfg client.Config, r *client.Relay, reachErr error) check {
+	fixTailnet := "Check that this machine is on the tailnet (tailscale status) and the relay is running."
+	if cfg.RelayKey == "" {
+		return check{"relay", "fail", "cannot reach the relay at " + cfg.Relay + ": " + reachErr.Error(),
+			fixTailnet + " If the relay moved to a new address, run tincan rejoin --relay <new URL>; this config has no relay key, so tincan cannot find it by itself."}
+	}
+	listed, source, searched := r.LastFind()
+	if !searched {
+		// The error was not a dead address (or a search ran moments
+		// ago), so there was no search to report on.
+		return check{"relay", "fail", "cannot reach the relay at " + cfg.Relay + ": " + reachErr.Error(), fixTailnet}
+	}
+	if source == "" {
+		return check{"relay", "fail", "cannot reach the relay at " + cfg.Relay + ", and this client cannot search the tailnet: " + reachErr.Error(),
+			fixTailnet + " A proxy-only sandbox cannot search the tailnet: run tincan rejoin --relay <new URL>."}
+	}
+	return check{"relay", "fail", fmt.Sprintf("cannot reach the relay at %s, and none of %d tailnet peers listed via %s proved they are this relay: %s", cfg.Relay, listed, source, reachErr.Error()),
+		fixTailnet + " If the relay moved, wait until this machine can see the new node, or run tincan rejoin --relay <new URL>."}
 }
 
 // addressCheck asks each address the relay advertises to prove it is this
@@ -200,6 +243,9 @@ func versionCheck(ctx context.Context, r *client.Relay, exe string) check {
 	if want == "" || err != nil {
 		return check{"version", "warn", fmt.Sprintf("tincan %s; relay release %s has no build to compare for this platform", Version, m.Version), ""}
 	}
+	if have != want && client.Ahead(Version, m.Version) {
+		return check{"version", "warn", fmt.Sprintf("tincan %s is newer than the relay's release %s", strings.TrimPrefix(Version, "v"), strings.TrimPrefix(m.Version, "v")), relayBehindAdvice(Version)}
+	}
 	if have != want {
 		return check{"version", "fail", fmt.Sprintf("tincan %s at %s is not the relay's release %s", Version, exe, m.Version), "Run tincan upgrade, then restart the app that runs tincan mcp so it starts the new build."}
 	}
@@ -228,7 +274,7 @@ func probeCheck(ctx context.Context, exe string, framed, joined bool) check {
 	if len(missing) > 0 {
 		return check{name, "fail", fmt.Sprintf("tincan mcp listed %d tools, missing %s", len(tools), strings.Join(missing, ", ")), "Run tincan upgrade."}
 	}
-	return check{name, "ok", fmt.Sprintf("%s mcp lists all %d tools", exe, len(tools)), ""}
+	return check{name, "ok", fmt.Sprintf("%s mcp lists all %d tools", exe, len(mcpserver.ToolNames)), ""}
 }
 
 // probeMCP runs initialize and tools/list against exe mcp and returns the
@@ -385,10 +431,58 @@ func launchCheck(ls []mcpserver.Launch, now time.Time) check {
 		}
 		return check{name, "warn", detail, "If the tools are missing now, the app has not started tincan since. Restart the app."}
 	}
-	if l.Version != "" && l.Version != Version {
-		return check{name, "warn", detail + fmt.Sprintf(" (running tincan %s, this binary is %s)", l.Version, Version), "Restart the app so it runs the current build."}
-	}
 	return check{name, "ok", detail, ""}
+}
+
+// buildCheck finds tincan mcp servers still running a different build
+// than this binary, the state tincan upgrade leaves behind until each app
+// reloads its server: the tools keep the old behavior, and a host can show
+// 0 tools after a partial restart. The builds are called different, not
+// older, since a relay can roll a release back. running says whether a
+// recorded server still runs.
+func buildCheck(ls []mcpserver.Launch, running func(mcpserver.Launch) bool) check {
+	const name = "mcp builds"
+	var stale []string
+	var steps []string
+	seen := map[string]bool{}
+	for _, l := range ls {
+		if !l.Ended.IsZero() || l.Version == "" || l.Version == Version || !running(l) {
+			continue
+		}
+		who := l.Client
+		if who == "" {
+			who = "an app"
+		}
+		stale = append(stale, fmt.Sprintf("%s (pid %d) runs tincan %s", who, l.PID, l.Version))
+		kind := mcpserver.HostKind(l.Client)
+		if !seen[kind] {
+			seen[kind] = true
+			steps = append(steps, hostLabel(kind)+": "+mcpserver.ReloadStep(kind))
+		}
+	}
+	if len(stale) == 0 {
+		return check{name, "ok", "no running tincan mcp is on a different build than this binary (" + Version + ")", ""}
+	}
+	servers := "servers are"
+	if len(stale) == 1 {
+		servers = "server is"
+	}
+	return check{name, "warn", fmt.Sprintf("%d running tincan mcp %s on a different build than this binary (%s): %s",
+		len(stale), servers, Version, strings.Join(stale, "; ")),
+		"Reload each so it starts the new build. " + strings.Join(steps, ". ") + "."}
+}
+
+// hostLabel names a host kind for people.
+func hostLabel(kind string) string {
+	switch kind {
+	case mcpserver.HostClaudeCode:
+		return "Claude Code"
+	case mcpserver.HostCodex:
+		return "Codex"
+	case mcpserver.HostCursor:
+		return "Cursor"
+	}
+	return "other apps"
 }
 
 // hostFix is the repair for an app that lists tincan but does not run it.
@@ -400,7 +494,7 @@ func hostFix(exe string) []string {
 	return []string{
 		"Remove every tincan server from the app, including old or oddly named ones (for example \"user-tincan\" or \"user-tincan mcp\"). The mcp config entries above show where they are.",
 		"Add exactly one server named tincan: " + string(entry),
-		"Use the full path to the binary and put mcp in args, not in the command. Claude Code adds --channel after mcp for channel wakes.",
+		"Use the full path to the binary and put mcp in args, not in the command. Claude Code adds --channel after mcp for channel wakes, and claude mcp add needs --scope user for the server to exist in every project (its default scope keeps it to the directory it was added in).",
 		"Quit and reopen the app (a reload of one server is not always enough), then start a new chat.",
 		"Run tincan doctor again: app launches should say the app listed the tools.",
 	}
@@ -417,7 +511,11 @@ func printDoctor(w io.Writer, rep doctorReport) {
 	if len(rep.Configs) > 0 {
 		fmt.Fprintln(w, "\nMCP config entries that mention tincan:")
 		for _, e := range rep.Configs {
-			fmt.Fprintf(w, "  %s: %q runs %s %s", e.File, e.Name, e.Command, strings.Join(e.Args, " "))
+			fmt.Fprintf(w, "  %s", e.File)
+			if e.Scope != "" {
+				fmt.Fprintf(w, " (%s)", e.Scope)
+			}
+			fmt.Fprintf(w, ": %q runs %s %s", e.Name, e.Command, strings.Join(e.Args, " "))
 			if len(e.Problems) > 0 {
 				fmt.Fprintf(w, "  <- %s", strings.Join(e.Problems, "; "))
 			}

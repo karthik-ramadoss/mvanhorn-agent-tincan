@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
+	"github.com/mvanhorn/agent-tincan/internal/envelope"
 	"github.com/mvanhorn/agent-tincan/internal/mcpserver"
 )
 
@@ -41,18 +44,34 @@ for another session or a later check. Start Claude Code with:
 				return err
 			}
 			files := mcpserver.LocalFiles(client.AttachmentDir(cfg))
+			watch := mcpserver.Watch(mcpserver.NewBuildWatch(ownBinary(), Version))
 			if !channel {
-				return mcpserver.New(r, Version, files).Run(cmd.Context(), mcpserver.StdioRecorded(rec))
+				return mcpserver.New(r, Version, files, watch).Run(cmd.Context(), mcpserver.StdioRecorded(rec))
 			}
 			t := mcpserver.NewChannelTransport(mcpserver.StdioRecorded(rec))
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 			go pushWaiting(ctx, r, t)
-			return mcpserver.NewWithOptions(r, Version, mcpserver.ChannelOptions(), files).Run(ctx, t)
+			return mcpserver.NewWithOptions(r, Version, mcpserver.ChannelOptions(), files, watch).Run(ctx, t)
 		},
 	}
 	cmd.Flags().BoolVar(&channel, "channel", false, "announce waiting teammate requests and replies in a running Claude Code session (channels preview)")
 	return cmd
+}
+
+// ownBinary is the path of the running tincan binary with symlinks
+// resolved, or "" when it cannot be found. It is read at startup: on Linux
+// the path is gone from /proc/self/exe once an upgrade renames a new file
+// over it.
+func ownBinary() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return exe
 }
 
 // channelPusher is the part of the channel transport pushWaiting uses.
@@ -74,6 +93,7 @@ var reannounceAfter = 10 * time.Minute
 // pushWaiting announces teammate requests and replies to this agent's own
 // requests with a short channel notice. It only peeks, so it never claims a
 // request or marks a reply seen: the model takes them by calling check_inbox.
+// Pings are the exception: it claims and answers them without a notice.
 // Every open Claude Code session runs one of these; the first model to call
 // check_inbox gets the items and the others find an empty inbox. An item is
 // announced once per process (an id counts only after a push carrying it
@@ -86,6 +106,10 @@ func pushWaiting(ctx context.Context, r *client.Relay, t channelPusher) {
 	case <-t.Ready():
 	}
 	var a announcer
+	// Peeks advertise ping support, so this loop answers pings itself, as
+	// listen does; failed pongs retry in the background.
+	var retries client.PongRetries
+	defer retries.Wait()
 	backoff := time.Second
 	for ctx.Err() == nil {
 		w, err := r.Peek(ctx, client.DefaultPollHold)
@@ -97,7 +121,19 @@ func pushWaiting(ctx context.Context, r *client.Relay, t channelPusher) {
 			}
 			continue
 		}
+		w, pingFailed := answerChannelPings(ctx, r, w, &retries)
+		if pingFailed && w.Total <= 0 {
+			sleepCtx(ctx, jitter(backoff))
+			backoff = min(backoff*2, 30*time.Second)
+			continue
+		}
 		backoff = time.Second
+		// Channels are Claude Code's, so the reload step is its.
+		if err := client.ReportUpgradeReload(client.UpgradeSurfaceChannel, w.UpgradeAvailable, mcpserver.ReloadStep(mcpserver.HostClaudeCode), func(line string) error {
+			return t.Push(ctx, line, map[string]string{"kind": "upgrade", "upgrade_available": w.UpgradeAvailable})
+		}); err != nil {
+			log.Printf("tincan channel: push upgrade: %v", err)
+		}
 		if n, ok := a.next(w, time.Now()); ok {
 			if err := t.Push(ctx, n.content, n.meta); err != nil {
 				log.Printf("tincan channel: push: %v", err)
@@ -111,22 +147,53 @@ func pushWaiting(ctx context.Context, r *client.Relay, t channelPusher) {
 	}
 }
 
+// answerChannelPings answers the pings a peek lists and returns the peek
+// without them, so they never become a channel notice, and whether any
+// ping failed.
+func answerChannelPings(ctx context.Context, r client.PingResponder, w client.Waiting, retries *client.PongRetries) (client.Waiting, bool) {
+	failed := false
+	rest := w.Pending[:0:0]
+	for _, p := range w.Pending {
+		if p.Kind != envelope.KindPing {
+			rest = append(rest, p)
+			continue
+		}
+		_, retry, err := client.AnswerPings(ctx, r, client.Inbox{Requests: []envelope.Request{{ID: p.ID, Kind: envelope.KindPing}}}, "channel")
+		if err != nil {
+			failed = true
+		}
+		retries.Go(ctx, retry)
+	}
+	w.Pending = rest
+	w.Total = max(w.Total-w.Pings, 0)
+	w.Queued = max(w.Queued-w.Pings, 0)
+	w.Pings = 0
+	return w, failed
+}
+
 // announcer decides when a peek is worth a channel notice.
 type announcer struct {
 	seen map[string]bool // item keys announced and still waiting
 	last time.Time       // last successful push
+	// urgent is the urgent count last announced, lowered as urgent requests
+	// are taken. A rise means a new urgent request even when it sits past
+	// the capped pending list, so its id is not there to be seen.
+	urgent int
 }
 
 type notice struct {
 	content string
 	meta    map[string]string
 	keys    []string
+	urgent  int
 }
 
 // next returns the notice for what w shows waiting, and whether to push it:
-// only when some item is new, or all were announced over reannounceAfter ago.
+// only when some item is new, the urgent count rose, or all were announced
+// over reannounceAfter ago.
 func (a *announcer) next(w client.Waiting, now time.Time) (notice, bool) {
 	var keys, ids, from []string
+	urgent := 0
 	senders := map[string]bool{}
 	addFrom := func(name string) {
 		if name != "" && !senders[name] {
@@ -135,9 +202,13 @@ func (a *announcer) next(w client.Waiting, now time.Time) (notice, bool) {
 		}
 	}
 	for _, p := range w.Pending {
+		if p.Urgent {
+			urgent++
+		}
 		keys, ids = append(keys, "q:"+p.ID), append(ids, p.ID)
 		addFrom(p.From)
 	}
+	urgent = max(urgent, w.Urgent)
 	if len(w.Pending) == 0 && w.Queued > 0 {
 		// A relay that predates pending gives only a count.
 		keys = append(keys, fmt.Sprintf("q#%d", w.Queued))
@@ -156,6 +227,10 @@ func (a *announcer) next(w client.Waiting, now time.Time) (notice, bool) {
 		}
 	}
 	a.seen = still // forget items someone has since taken
+	a.urgent = min(a.urgent, urgent)
+	if urgent > a.urgent {
+		fresh = true
+	}
 	if len(keys) == 0 || (!fresh && now.Sub(a.last) < reannounceAfter) {
 		return notice{}, false
 	}
@@ -167,15 +242,24 @@ func (a *announcer) next(w client.Waiting, now time.Time) (notice, bool) {
 	case len(w.Replies) > 0:
 		kind = "reply"
 	}
+	content := channelNotice(count, from)
+	if urgent > 0 {
+		noun := "requests"
+		if urgent == 1 {
+			noun = "request"
+		}
+		content = fmt.Sprintf("%d urgent %s waiting. %s", urgent, noun, content)
+	}
 	return notice{
-		content: channelNotice(count, from),
+		content: content,
 		meta: map[string]string{
 			"kind":        kind,
 			"count":       strconv.Itoa(count),
 			"from":        strings.Join(from, ","),
 			"request_ids": strings.Join(ids, ","),
 		},
-		keys: keys,
+		keys:   keys,
+		urgent: urgent,
 	}, true
 }
 
@@ -187,6 +271,7 @@ func (a *announcer) pushed(n notice, now time.Time) {
 	for _, k := range n.keys {
 		a.seen[k] = true
 	}
+	a.urgent = n.urgent
 	a.last = now
 }
 

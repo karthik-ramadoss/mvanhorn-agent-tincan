@@ -8,14 +8,22 @@ package identity
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
+	"net"
+	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // InviteTTL is how long an invite code stays valid.
@@ -26,10 +34,12 @@ const InviteTTL = 10 * time.Minute
 const LocalAdmin = "local-admin"
 
 var (
-	ErrNotJoined    = errors.New("not a joined agent")
-	ErrNotAdmin     = errors.New("admin commands must come from an admin device")
-	ErrBadInvite    = errors.New("invite code is invalid, used, or expired")
-	ErrUnknownAgent = errors.New("no such agent")
+	ErrNotJoined          = errors.New("not a joined agent")
+	ErrNotAdmin           = errors.New("admin commands must come from an admin device")
+	ErrBadInvite          = errors.New("invite code is invalid, used, or expired")
+	ErrUnknownAgent       = errors.New("no such agent")
+	ErrEnrollmentConflict = errors.New("enrollment conflicts with existing binding")
+	ErrPendingInvite      = errors.New("enrollment conflicts with pending invitation")
 	// ErrAgentAmbiguous means several agents share the calling machine and the
 	// request did not say which one it comes from.
 	ErrAgentAmbiguous = errors.New("several agents share this machine; the client must name one (point TINCAN_CONFIG at that agent's config)")
@@ -41,12 +51,53 @@ var (
 
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 
+var serviceTagRE = regexp.MustCompile(`^tag:[a-z][a-z0-9-]*$`)
+
+// ValidateServiceRoles validates explicit environment-level grants. A shared
+// backend tag is not a dedicated authorization role. Configuration must come
+// from the relay owner; neither a hostname nor a request header defines a role.
+func ValidateServiceRoles(roles map[string]string) error {
+	for tag, name := range roles {
+		if !serviceTagRE.MatchString(tag) || tag == "tag:codex-forgejo" {
+			return fmt.Errorf("service role %q must be a dedicated Tailscale tag (tag:codex-forgejo is shared)", tag)
+		}
+		if !ValidName(name) {
+			return fmt.Errorf("service role %q has invalid agent name %q", tag, name)
+		}
+	}
+	return nil
+}
+
+// ValidName reports whether name is an agent name the relay accepts: 1-32
+// lowercase letters, digits or dashes, starting with a letter or digit.
+func ValidName(name string) bool { return nameRE.MatchString(name) }
+
 // Kinds share the name shape: lowercase words such as hermes or vm-webhook.
 func checkKind(kind string) error {
 	if kind != "" && !nameRE.MatchString(kind) {
 		return fmt.Errorf("agent kind %q must be 1-32 lowercase letters, digits, or dashes", kind)
 	}
 	return nil
+}
+
+// maxGoodAtRunes caps an agent's good-at line so the roster stays scannable.
+const maxGoodAtRunes = 120
+
+// checkGoodAt trims line and reports the line to store ("" clears it). A line
+// is one printable line: valid UTF-8, at most maxGoodAtRunes runes, and no
+// control or format characters, newlines and tabs included.
+func checkGoodAt(line string) (string, error) {
+	line = strings.TrimSpace(line)
+	if !utf8.ValidString(line) {
+		return "", errors.New("the good-at line is not valid UTF-8")
+	}
+	if utf8.RuneCountInString(line) > maxGoodAtRunes {
+		return "", fmt.Errorf("the good-at line is over %d characters", maxGoodAtRunes)
+	}
+	if strings.IndexFunc(line, func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }) >= 0 {
+		return "", errors.New("the good-at line contains a line break or other control character")
+	}
+	return line, nil
 }
 
 // Agent is a joined agent.
@@ -60,9 +111,16 @@ type Agent struct {
 	// NodeUser is the Tailscale login that owned the node at join, empty for
 	// agents joined before it was recorded.
 	NodeUser string `json:"node_user,omitempty"`
+	// GoodAt is the owner-written line saying what the agent is good at,
+	// empty when unset. Only SetAgentGoodAt writes it; PutAgent keeps it.
+	GoodAt string `json:"good_at,omitempty"`
 }
 
 // Invite is a pending one-time code.
+//
+// Code carries the raw code only at mint time, on the way to the admin that
+// asked for it. Everything persisted (see PutInvite) holds only the digest
+// produced by hashInviteCode, never the raw code.
 type Invite struct {
 	Code    string
 	Name    string
@@ -73,6 +131,11 @@ type Invite struct {
 // Store persists agents and invites. The relay backs it with SQLite; tests
 // use NewMemoryStore.
 type Store interface {
+	// CreateAgent inserts without replacement, rejecting an unexpired invite.
+	CreateAgent(ctx context.Context, a Agent, now time.Time) (Agent, bool, error)
+	// ReplaceAgentNode compares the expected binding and changes only node identity.
+	// Persistent stores must commit the replacement and its audit together.
+	ReplaceAgentNode(ctx context.Context, name, expectedOld string, target Node, now time.Time) (Agent, error)
 	PutAgent(ctx context.Context, a Agent) error
 	DeleteAgent(ctx context.Context, name string) (bool, error)
 	Agents(ctx context.Context) ([]Agent, error)
@@ -83,10 +146,18 @@ type Store interface {
 	// SetAgentKind records an agent's runtime kind ("" clears it) and reports
 	// whether the agent exists.
 	SetAgentKind(ctx context.Context, name, kind string) (bool, error)
+	// SetAgentGoodAt records an agent's owner-written good-at line ("" clears
+	// it) and reports whether the agent exists. PutAgent keeps the line an
+	// existing agent already has.
+	SetAgentGoodAt(ctx context.Context, name, line string) (bool, error)
 	// PutInvite stores inv and retires any earlier unredeemed code for the
 	// same name, so re-inviting a name leaves only the newest code valid.
+	// Callers pass inv.Code already digested (see hashInviteCode); the raw
+	// code never reaches the store. Implementations persist the value
+	// opaquely — they hold no pepper and perform no hashing.
 	PutInvite(ctx context.Context, inv Invite) error
 	// TakeInvite removes and returns the invite, so a code works once.
+	// Callers pass the digest produced by hashInviteCode, not the raw code.
 	TakeInvite(ctx context.Context, code string) (Invite, bool, error)
 }
 
@@ -100,24 +171,75 @@ type Config struct {
 	AdminLogins []string
 	// NoAutoRebind turns off re-admitting rebuilt machines (see ResolveAgent).
 	NoAutoRebind bool
+	// ServiceRoles explicitly grants a verified WhoIs tag access to an already
+	// enrolled logical agent. It does not prove which task started the node.
+	// A service-role call never moves the agent's stored node binding. Nil or
+	// empty preserves normal node-bound authorization.
+	ServiceRoles map[string]string
+	// InvitePepper is the relay-local secret used to digest invite codes
+	// before they are persisted (see hashInviteCode). When empty, NewDirectory
+	// generates an ephemeral one: fine for tests and single-process relays,
+	// but a production relay must pass a pepper persisted in its state dir so
+	// outstanding invites survive a restart.
+	InvitePepper []byte
 	// Now overrides the clock in tests.
 	Now func() time.Time
 }
 
 // Directory maps tailnet nodes to agent names.
 type Directory struct {
-	store Store
-	who   Resolver
-	cfg   Config
-	mu    sync.Mutex // serializes join so a name moves atomically
+	store        Store
+	who          Resolver
+	cfg          Config
+	invitePepper []byte
+	mu           sync.Mutex // serializes join so a name moves atomically
 }
 
-// NewDirectory builds a Directory.
+// NewDirectory builds a Directory. Invalid ServiceRoles or an InvitePepper
+// other than 32 bytes panics, so a misconfigured grant or key fails fast.
 func NewDirectory(store Store, who Resolver, cfg Config) *Directory {
+	if err := ValidateServiceRoles(cfg.ServiceRoles); err != nil {
+		panic(fmt.Sprintf("identity: %v", err))
+	}
+	if cfg.ServiceRoles != nil {
+		// Freeze the authorization policy so later caller map changes cannot
+		// silently add grants or race request attribution.
+		roles := make(map[string]string, len(cfg.ServiceRoles))
+		maps.Copy(roles, cfg.ServiceRoles)
+		cfg.ServiceRoles = roles
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Directory{store: store, who: who, cfg: cfg}
+	pepper := cfg.InvitePepper
+	if len(pepper) == 0 {
+		// Ephemeral pepper: outstanding invites are lost on restart, which is
+		// acceptable for tests. Production relays pass a persisted pepper.
+		pepper = make([]byte, 32)
+		if _, err := rand.Read(pepper); err != nil {
+			panic(fmt.Sprintf("identity: cannot generate invite pepper: %v", err))
+		}
+	} else {
+		if len(pepper) != 32 {
+			panic(fmt.Sprintf("identity: invite pepper has %d bytes, want 32", len(pepper)))
+		}
+		// Copy: the Directory must not retain the caller's buffer, which the
+		// caller could mutate after minting and silently invalidate
+		// outstanding invites.
+		pepper = append([]byte(nil), pepper...)
+	}
+	return &Directory{store: store, who: who, cfg: cfg, invitePepper: pepper}
+}
+
+// hashInviteCode returns the hex HMAC-SHA256 of the normalized code under the
+// relay's invite pepper. Only this digest is ever persisted; the raw code is
+// shown once to the admin that minted it and never stored. The pepper makes
+// the 40-bit code space unsearchable to anyone holding only the database.
+func hashInviteCode(pepper []byte, code string) string {
+	norm := strings.ToUpper(strings.TrimSpace(code))
+	mac := hmac.New(sha256.New, pepper)
+	mac.Write([]byte(norm))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // Attribute returns the agent name for the node behind remoteAddr when the
@@ -141,9 +263,29 @@ func (d *Directory) Resolve(ctx context.Context, remoteAddr, claimed string) (st
 // carries no agent, or not the claimed one, it tries to re-admit the node as
 // a rebuilt machine before refusing.
 func (d *Directory) ResolveAgent(ctx context.Context, remoteAddr, claimed string) (Resolved, error) {
+	res, _, err := d.ResolveActor(ctx, remoteAddr, claimed)
+	return res, err
+}
+
+// ResolveActor also returns the authenticated caller's actual StableID. A
+// service-role grant changes only the logical name; the actor remains the node
+// WhoIs verified, so distinct workers do not share an ownership or audit actor.
+// ResolveAgent and Resolve retain their existing result shapes.
+func (d *Directory) ResolveActor(ctx context.Context, remoteAddr, claimed string) (Resolved, string, error) {
 	n, err := d.who.WhoIs(ctx, remoteAddr)
 	if err != nil {
-		return Resolved{}, err
+		return Resolved{}, "", err
+	}
+	res, err := d.resolveNode(ctx, n, claimed)
+	if err != nil {
+		return Resolved{}, "", err
+	}
+	return res, n.ID, nil
+}
+
+func (d *Directory) resolveNode(ctx context.Context, n Node, claimed string) (Resolved, error) {
+	if res, matched, err := d.resolveServiceRole(ctx, n, claimed); matched || err != nil {
+		return res, err
 	}
 	agents, err := d.store.AgentsByNode(ctx, n.ID)
 	if err != nil {
@@ -180,6 +322,42 @@ func (d *Directory) ResolveAgent(ctx context.Context, remoteAddr, claimed string
 		return d.resolved(ctx, n, agents[0])
 	}
 	return Resolved{}, fmt.Errorf("%s runs %s: %w", n.Name, strings.Join(agentNames(agents), ", "), ErrAgentAmbiguous)
+}
+
+// resolveServiceRole uses only tags returned by WhoIs, never the machine name
+// or claimed header. A claim may narrow the grant to its configured name; it
+// cannot select among conflicting grants or create a missing logical agent.
+func (d *Directory) resolveServiceRole(ctx context.Context, n Node, claimed string) (Resolved, bool, error) {
+	var name string
+	for _, tag := range n.Tags {
+		target, ok := d.cfg.ServiceRoles[tag]
+		if !ok {
+			continue
+		}
+		if name != "" && name != target {
+			return Resolved{}, true, fmt.Errorf("%s has conflicting service roles: %w", n.Name, ErrAgentAmbiguous)
+		}
+		name = target
+	}
+	if name == "" {
+		return Resolved{}, false, nil
+	}
+	if n.ID == "" || strings.HasPrefix(n.ID, VirtualPrefix) {
+		return Resolved{}, true, fmt.Errorf("service role requires a tailnet StableID: %w", ErrNotJoined)
+	}
+	if claimed != "" && claimed != name {
+		return Resolved{}, true, fmt.Errorf("service role is not %q: %w", claimed, ErrNotJoined)
+	}
+	_, found, err := d.store.AgentByName(ctx, name)
+	if err != nil {
+		return Resolved{}, true, err
+	}
+	if !found {
+		return Resolved{}, true, fmt.Errorf("service role agent %q is not enrolled: %w", name, ErrNotJoined)
+	}
+	// Deliberately bypass resolved and readmit: there is no login recording,
+	// enrollment, virtual binding, or persisted node replacement here.
+	return Resolved{Name: name, ServiceRole: true}, true, nil
 }
 
 // resolved returns a, which is bound to n. An agent joined before logins
@@ -249,11 +427,81 @@ func (d *Directory) InviteKind(ctx context.Context, remoteAddr, name, kind strin
 	if err != nil {
 		return "", err
 	}
-	inv := Invite{Code: code, Name: name, Kind: kind, Expires: d.cfg.Now().Add(InviteTTL)}
+	// Persist only the digest; the raw code is returned once to the admin and
+	// never stored.
+	inv := Invite{Code: hashInviteCode(d.invitePepper, code), Name: name, Kind: kind, Expires: d.cfg.Now().Add(InviteTTL)}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if err := d.store.PutInvite(ctx, inv); err != nil {
 		return "", err
 	}
 	return code, nil
+}
+
+// EnrollNode is an owner-local enrollment with independently resolved identity.
+// It never issues an invitation, changes an existing binding, or grants admin.
+func (d *Directory) EnrollNode(ctx context.Context, remoteAddr, name, kind, stableID, ip, nodeName string) (Agent, bool, error) {
+	if remoteAddr != LocalAdmin {
+		return Agent{}, false, ErrNotAdmin
+	}
+	if kind == "" || checkKind(kind) != nil {
+		return Agent{}, false, errors.New("invalid enrollment identity metadata")
+	}
+	n, err := d.enrollmentNode(ctx, name, stableID, ip, nodeName)
+	if err != nil {
+		return Agent{}, false, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := d.cfg.Now()
+	return d.store.CreateAgent(ctx, Agent{Name: name, Kind: kind, NodeID: n.ID, NodeName: n.Name, NodeUser: n.User, JoinedAt: now}, now)
+}
+
+// RebindNode replaces one existing binding only when expectedOld still matches.
+// It creates no invitation and leaves agent metadata and work intact.
+func (d *Directory) RebindNode(ctx context.Context, remoteAddr, name, expectedOld, stableID, ip, nodeName string) (Agent, error) {
+	if remoteAddr != LocalAdmin {
+		return Agent{}, ErrNotAdmin
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9]{1,64}$`).MatchString(expectedOld) || expectedOld == stableID {
+		return Agent{}, errors.New("rebind requires a distinct expected old node")
+	}
+	n, err := d.enrollmentNode(ctx, name, stableID, ip, nodeName)
+	if err != nil {
+		return Agent{}, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.store.ReplaceAgentNode(ctx, name, expectedOld, n, d.cfg.Now())
+}
+
+func (d *Directory) enrollmentNode(ctx context.Context, name, stableID, ip, nodeName string) (Node, error) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || addr.Zone() != "" || addr.Is4In6() || (!netip.MustParsePrefix("100.64.0.0/10").Contains(addr) && !netip.MustParsePrefix("fd7a:115c:a1e0::/48").Contains(addr)) {
+		return Node{}, errors.New("enrollment requires a literal Tailscale IP")
+	}
+	if !ValidName(name) || !regexp.MustCompile(`^[A-Za-z0-9]{1,64}$`).MatchString(stableID) || !regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`).MatchString(nodeName) {
+		return Node{}, errors.New("invalid enrollment identity metadata")
+	}
+	n, err := d.who.WhoIs(ctx, net.JoinHostPort(addr.String(), "1"))
+	if err != nil {
+		return Node{}, fmt.Errorf("enrollment whois: %w", err)
+	}
+	if n.ID != stableID || n.Name != nodeName {
+		return Node{}, errors.New("enrollment identity mismatch")
+	}
+	status, ok := d.who.(NodeStatus)
+	if !ok {
+		return Node{}, errors.New("enrollment online metadata unavailable")
+	}
+	online, found, err := status.NodeOnline(ctx, n.ID)
+	if err != nil {
+		return Node{}, fmt.Errorf("enrollment status: %w", err)
+	}
+	if !found || !online {
+		return Node{}, errors.New("enrollment node is missing or offline")
+	}
+	return n, nil
 }
 
 // Join binds the node behind remoteAddr to the invite's name. A node that
@@ -267,7 +515,8 @@ func (d *Directory) Join(ctx context.Context, remoteAddr, code string) (string, 
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	inv, ok, err := d.store.TakeInvite(ctx, strings.ToUpper(strings.TrimSpace(code)))
+	// Look up by digest: the store never sees the raw code.
+	inv, ok, err := d.store.TakeInvite(ctx, hashInviteCode(d.invitePepper, code))
 	if err != nil {
 		return "", err
 	}
@@ -325,6 +574,29 @@ func (d *Directory) SetKind(ctx context.Context, remoteAddr, name, kind string) 
 		return fmt.Errorf("%s: %w", name, ErrUnknownAgent)
 	}
 	return nil
+}
+
+// SetGoodAt records the owner's line saying what an agent is good at (""
+// clears it) and returns the line as stored. Only admin devices may set it.
+func (d *Directory) SetGoodAt(ctx context.Context, remoteAddr, name, line string) (string, error) {
+	if err := d.requireAdmin(ctx, remoteAddr); err != nil {
+		return "", err
+	}
+	line, err := checkGoodAt(line)
+	if err != nil {
+		return "", err
+	}
+	// Serialize with Join, as SetKind does.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ok, err := d.store.SetAgentGoodAt(ctx, name, line)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("%s: %w", name, ErrUnknownAgent)
+	}
+	return line, nil
 }
 
 // Agents lists joined agents.

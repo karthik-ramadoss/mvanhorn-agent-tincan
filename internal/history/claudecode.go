@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -161,17 +162,40 @@ var claudeBuiltins = map[string]bool{
 }
 
 // claudeInjected are prefixes of user-role text that Claude Code writes
-// itself.
+// itself. The Desktop app's scheduled tasks and Create PR button are
+// among them: their records look typed (origin human, promptSource sdk).
 var claudeInjected = []string{
 	"<local-command-", "<task-notification", "<system-reminder>", "<bash-",
 	"<fork-boilerplate>", "<user-prompt-submit-hook>", "[Request interrupted",
-	"Caveat: The messages below",
+	"Caveat: The messages below", "<scheduled-task", "<create-pr-command",
+}
+
+// openTag matches the start of an XML element and captures its name.
+var openTag = regexp.MustCompile(`^<([A-Za-z][A-Za-z0-9_-]*)[\s>]`)
+
+// injectedElement reports whether s is one XML element, <name>...</name>
+// with nothing outside it, whose name has a '-' or '_'. Everything Claude
+// Code writes into the user role itself has that shape, and the Desktop
+// app keeps adding kinds, so the claudeInjected prefixes alone would
+// report each new kind as something Matt typed until it was listed.
+// People do wrap prompts in tags like <instructions> or paste HTML and
+// SVG, so a plain one-word name is never taken as injected, and the
+// first closing tag must be the one at the end.
+func injectedElement(s string) bool {
+	m := openTag.FindStringSubmatch(s)
+	if m == nil || !strings.ContainsAny(m[1], "-_") {
+		return false
+	}
+	end := "</" + m[1] + ">"
+	return strings.HasSuffix(s, end) && strings.Index(s, end) == len(s)-len(end)
 }
 
 // claudePromptText turns user-role text into Matt's prompt, or reports
 // false for text Claude Code injected. A custom slash command becomes
-// "/name args".
-func claudePromptText(s string) (string, bool) {
+// "/name args". sdk says the record came in with promptSource "sdk", the
+// way the Desktop app's injections arrive; only those can be dropped as an
+// unlisted injected element, so a prompt Matt typed or queued never is.
+func claudePromptText(s string, sdk bool) (string, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return "", false
@@ -191,6 +215,9 @@ func claudePromptText(s string) (string, bool) {
 		if strings.HasPrefix(s, p) {
 			return "", false
 		}
+	}
+	if sdk && injectedElement(s) {
+		return "", false
 	}
 	return s, true
 }
@@ -262,7 +289,7 @@ func (c *ClaudeCode) parse(e claudeEntry, all, images bool) (thread, bool, error
 					}
 				}
 			}
-			text, ok := claudePromptText(strings.Join(texts, "\n"))
+			text, ok := claudePromptText(strings.Join(texts, "\n"), r.PromptSource == "sdk")
 			if !ok && nImages == 0 {
 				return true
 			}
@@ -301,45 +328,49 @@ func (c *ClaudeCode) parse(e claudeEntry, all, images bool) (thread, bool, error
 }
 
 // List implements Reader.
-func (c *ClaudeCode) List(ctx context.Context, count int, opts Options) ([]Conversation, error) {
+func (c *ClaudeCode) List(ctx context.Context, count int, opts Options) (Page, error) {
 	if err := checkListCount(count); err != nil {
-		return nil, err
+		return Page{}, err
 	}
 	cands, err := c.candidates(ctx)
 	if err != nil {
-		return nil, err
+		return Page{}, err
 	}
-	w, now := c.Window.orDefault(), c.now()
-	var out []Conversation
+	w, now := effectiveWindow(c.Window, opts), c.now()
+	page := Page{Window: w}
 	for _, e := range cands {
-		if len(out) >= count || !w.fresh(e.updated, now) {
+		if len(page.Conversations) >= count {
+			break
+		}
+		if !w.fresh(e.updated, now) {
+			page.Limited = LimitAge
 			break
 		}
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return Page{}, err
 		}
 		th, ok, err := c.parse(e, opts.All, false)
 		if err != nil {
-			return nil, err
+			return Page{}, err
 		}
 		if ok && len(th.turns) > 0 {
-			out = append(out, th.conv)
+			page.Conversations = append(page.Conversations, th.conv)
 		}
 	}
-	return out, nil
+	return page, nil
 }
 
 // Read implements Reader.
-func (c *ClaudeCode) Read(ctx context.Context, q Query, opts Options) ([]Conversation, error) {
+func (c *ClaudeCode) Read(ctx context.Context, q Query, opts Options) (Page, error) {
 	if err := q.Validate(); err != nil {
-		return nil, err
+		return Page{}, err
 	}
 	if err := checkSource(SourceClaudeCode, q); err != nil {
-		return nil, err
+		return Page{}, err
 	}
 	cands, err := c.candidates(ctx)
 	if err != nil {
-		return nil, err
+		return Page{}, err
 	}
 	if q.Mode == ModeConversation {
 		for _, e := range cands {
@@ -348,15 +379,15 @@ func (c *ClaudeCode) Read(ctx context.Context, q Query, opts Options) ([]Convers
 			}
 			th, ok, err := c.parse(e, opts.All, q.wantsImages())
 			if err != nil {
-				return nil, err
+				return Page{}, err
 			}
 			if ok {
-				return []Conversation{conversationMessages(th, q.wantsImages())}, nil
+				return Page{Conversations: []Conversation{conversationMessages(th, q.wantsImages())}, Window: effectiveWindow(c.Window, opts)}, nil
 			}
 		}
-		return nil, fmt.Errorf("claude-code: %w: %s", ErrNotFound, q.ConversationID)
+		return Page{}, fmt.Errorf("claude-code: %w: %s", ErrNotFound, q.ConversationID)
 	}
-	return pick(q, c.Window, c.now(), len(cands),
+	return pick(q, effectiveWindow(c.Window, opts), c.now(), len(cands), false,
 		func(i int) time.Time { return cands[i].updated },
 		func(i int) (thread, bool, error) {
 			if err := ctx.Err(); err != nil {

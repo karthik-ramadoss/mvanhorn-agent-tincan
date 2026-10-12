@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,15 +32,22 @@ import (
 )
 
 type relayFlags struct {
-	listen      string
-	hostname    string
-	stateDir    string
-	port        int
-	admins      []string
-	adminLogins []string
-	noRebind    bool
-	replyGrace  time.Duration
-	dist        string
+	urgentPerHour  int
+	listen         string
+	hostname       string
+	stateDir       string
+	port           int
+	admins         []string
+	adminLogins    []string
+	noRebind       bool
+	serviceRoles   map[string]string
+	claimOwners    []string
+	eventMailboxes []string
+	replyGrace     time.Duration
+	notesTTL       time.Duration
+	dist           string
+	upgradeExit    bool
+	releaseURL     string
 
 	gateway         bool
 	gatewayHostname string
@@ -64,6 +74,10 @@ state dir, chmod 600. They are never sent to agents. A webhook or email agent
 is also woken when a reply to its own request is still unread after
 --reply-grace.
 
+An unanswered request expires after 24 hours, except one to a notes-kind
+agent, which waits --notes-ttl (30 days by default) so a sleeping notes Mac
+loses nothing.
+
 A rebuilt machine (a new Tailscale node with the same machine name, or that
 name plus a "-1" style suffix) is re-admitted as its old agent on its first
 call when it is untagged, owned by the login recorded at join, and the old
@@ -73,8 +87,37 @@ off with --no-auto-rebind.
 With --dist <dir>, the relay serves tincan release binaries from dir to joined
 agents and admins, so tincan upgrade works on machines without GitHub access.
 Put the raw binaries there as tincan_<os>_<arch> (linux or darwin, amd64 or
-arm64), plus checksums.txt and a VERSION file naming the release.`,
-		RunE: func(cmd *cobra.Command, _ []string) error { return runRelay(cmd.Context(), f) },
+arm64), plus checksums.txt and a VERSION file naming the release. An admin can
+then upgrade the relay itself with tincan relay-upgrade: it installs the dist
+build over this binary (which the relay user must own) and re-executes, or
+with --upgrade-exit exits with status 75 for its supervisor to restart it.`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := identity.ValidateServiceRoles(f.serviceRoles); err != nil {
+				return err
+			}
+			for _, name := range append(append([]string{}, f.claimOwners...), f.eventMailboxes...) {
+				if !identity.ValidName(name) {
+					return fmt.Errorf("invalid configured agent name %q", name)
+				}
+			}
+			if len(f.eventMailboxes) > 0 && !f.gateway {
+				return errors.New("--gateway-events-only requires --chatgpt-gateway")
+			}
+			if f.urgentPerHour < 1 {
+				return fmt.Errorf("--urgent-per-hour must be at least 1, got %d", f.urgentPerHour)
+			}
+			if f.notesTTL <= 0 {
+				return fmt.Errorf("--notes-ttl must be positive, got %s", f.notesTTL)
+			}
+			if f.releaseURL != "" && !strings.HasPrefix(f.releaseURL, "https://") {
+				return fmt.Errorf("--release-url must be an https URL, got %q", f.releaseURL)
+			}
+			err := runRelay(cmd.Context(), f)
+			if rs, ok := errors.AsType[*errRelayRestart](err); ok {
+				return rs.u.restart()
+			}
+			return err
+		},
 	}
 	cmd.Flags().StringVar(&f.listen, "listen", "", "bind this host tailnet IP (100.x.y.z) instead of starting tsnet")
 	cmd.Flags().StringVar(&f.hostname, "hostname", "tincan-relay", "tsnet node name")
@@ -83,8 +126,15 @@ arm64), plus checksums.txt and a VERSION file naming the release.`,
 	cmd.Flags().StringSliceVar(&f.admins, "admin", nil, "machine names allowed to run admin commands (e.g. macbook-pro-44,iphone182)")
 	cmd.Flags().StringSliceVar(&f.adminLogins, "admin-login", nil, "if set, admin machines must also be owned by one of these Tailscale logins")
 	cmd.Flags().BoolVar(&f.noRebind, "no-auto-rebind", false, "do not re-admit rebuilt machines automatically; they need a new invite")
+	cmd.Flags().StringToStringVar(&f.serviceRoles, "service-role", nil, "explicit verified dedicated tag to enrolled logical agent grants (tag:role=agent); disabled by default")
+	cmd.Flags().StringSliceVar(&f.claimOwners, "require-claim-ownership", nil, "agents migrated to server-enforced task/attempt claim ownership")
+	cmd.Flags().StringSliceVar(&f.eventMailboxes, "gateway-events-only", nil, "mailboxes whose gateway OAuth connections may only subscribe to MCP events; preserves backend binding")
+	cmd.Flags().IntVar(&f.urgentPerHour, "urgent-per-hour", 5, "maximum urgent requests per sender per hour")
 	cmd.Flags().DurationVar(&f.replyGrace, "reply-grace", wake.DefaultReplyGrace, "how long a reply may go unread before a webhook or email agent is woken to read it")
+	cmd.Flags().DurationVar(&f.notesTTL, "notes-ttl", 30*24*time.Hour, "how long a request to a notes-kind agent waits unanswered before it expires (other kinds keep 24h)")
 	cmd.Flags().StringVar(&f.dist, "dist", "", "serve tincan release binaries (tincan_<os>_<arch>, checksums.txt, VERSION) from this directory for tincan upgrade")
+	cmd.Flags().BoolVar(&f.upgradeExit, "upgrade-exit", false, "after tincan relay-upgrade, exit with status 75 for a supervisor to restart the relay instead of re-executing it")
+	cmd.Flags().StringVar(&f.releaseURL, "release-url", "", "let tincan relay-upgrade --from-github download releases from <url>/<tag>/<file> (for this project: "+GitHubReleaseURL+"); off when empty")
 	cmd.Flags().BoolVar(&f.gateway, "chatgpt-gateway", false, "serve the public ChatGPT MCP gateway through Tailscale Funnel (OAuth-protected)")
 	cmd.Flags().StringVar(&f.gatewayHostname, "gateway-hostname", "tincan-gateway", "tsnet node name for the Funnel gateway")
 	cmd.Flags().StringVar(&f.gatewayListen, "gateway-listen", "", "serve the gateway on this plain-HTTP address instead of Funnel (put your own TLS proxy in front)")
@@ -92,9 +142,114 @@ arm64), plus checksums.txt and a VERSION file naming the release.`,
 	return cmd
 }
 
+// relayConfig maps the relay flags onto the relay server.
+func (f relayFlags) relayConfig() relay.Config {
+	return relay.Config{Version: Version, NotesRequestTTL: f.notesTTL, RequireClaimOwnership: f.claimOwners}
+}
+
 // directoryConfig maps the relay flags onto the identity directory.
 func (f relayFlags) directoryConfig() identity.Config {
-	return identity.Config{Admins: f.admins, AdminLogins: f.adminLogins, NoAutoRebind: f.noRebind}
+	return identity.Config{Admins: f.admins, AdminLogins: f.adminLogins, NoAutoRebind: f.noRebind, ServiceRoles: f.serviceRoles}
+}
+
+// loadOrCreateInvitePepper returns the relay's invite-code pepper, creating
+// and persisting a fresh 256-bit one on first run. A private temporary file
+// is fully written, synced and closed before an atomic, no-replace link
+// publishes it. Exactly one writer wins; others read its complete key.
+// Filesystems without hard-link support fail closed. An existing file is
+// validated before use — it must be a regular file (never a symlink),
+// exactly 32 bytes, and inaccessible to group/other — and anything else
+// fails closed. A missing key beside an existing database is never silently
+// replaced: it is either a first upgrade (expected) or an accidental loss
+// (outstanding invites are stranded), and the operator is told which.
+func loadOrCreateInvitePepper(stateDir string) ([]byte, error) {
+	path := filepath.Join(stateDir, "invite-pepper")
+	if b, err := readInvitePepperFile(path); err == nil {
+		return b, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return nil, fmt.Errorf("generate invite pepper: %w", err)
+	}
+	// Never expose a partially written file at the final name. O_EXCL at
+	// that name elects one writer but still lets concurrent readers see an
+	// empty file before its first write. CreateTemp uses owner-only mode.
+	f, err := os.CreateTemp(stateDir, ".invite-pepper-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temporary invite pepper: %w", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("write invite pepper: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("sync invite pepper: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("close invite pepper: %w", err)
+	}
+	// Link is atomic and does not replace an existing destination. Rename
+	// would let a losing initializer overwrite the winner on Unix.
+	if err := os.Link(f.Name(), path); err != nil {
+		if os.IsExist(err) {
+			winner, readErr := readInvitePepperFile(path)
+			if readErr != nil {
+				return nil, fmt.Errorf("read the winning invite pepper: %w", readErr)
+			}
+			return winner, nil
+		}
+		return nil, fmt.Errorf("publish invite pepper: %w", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "relay.db")); err == nil {
+		log.Printf("warning: created a fresh invite pepper next to an existing relay.db: " +
+			"on a first upgrade from raw-code invites this is expected (legacy invites are invalidated); " +
+			"if the old invite-pepper file was lost, outstanding invites are stranded — restore it from backup")
+	}
+	return b, nil
+}
+
+// readInvitePepperFile reads an existing pepper key, refusing symlinks,
+// non-regular files, wrong permissions, and wrong lengths. A missing file
+// returns an os.IsNotExist error so the caller can create it.
+func readInvitePepperFile(path string) ([]byte, error) {
+	return readInvitePepperFileWithOpen(path, openInvitePepperFile)
+}
+
+// The opener is passed explicitly so validation can be exercised against
+// the actual opened file without timing-dependent filesystem tests.
+func readInvitePepperFileWithOpen(path string, open func(string) (*os.File, error)) ([]byte, error) {
+	f, err := open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	// Validate the handle that will be read, never a separately resolved path.
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("invite pepper %s is not a regular file", path)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		return nil, fmt.Errorf("invite pepper %s is accessible beyond its owner (mode %04o): refusing to use it", path, perm)
+	}
+	if fi.Size() != 32 {
+		return nil, fmt.Errorf("invite pepper %s has %d bytes, want 32", path, fi.Size())
+	}
+	// Bound reads even if another process changes the file after Stat.
+	b, err := io.ReadAll(io.LimitReader(f, 33))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) != 32 {
+		return nil, fmt.Errorf("invite pepper %s has %d bytes, want 32", path, len(b))
+	}
+	return b, nil
 }
 
 func defaultStateDir() string {
@@ -124,6 +279,23 @@ func listenAddr(listen string, port int) (string, error) {
 	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
 }
 
+// advertisePort is the port SelfURLs should name: the port --listen bound,
+// which may differ from --port when --listen carried :port.
+func advertisePort(listenAt string, flagPort int) int {
+	if listenAt == "" {
+		return flagPort
+	}
+	_, p, err := net.SplitHostPort(listenAt)
+	if err != nil {
+		return flagPort
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return flagPort
+	}
+	return n
+}
+
 func runRelay(ctx context.Context, f relayFlags) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -139,46 +311,40 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	if err := os.MkdirAll(f.stateDir, 0o700); err != nil {
 		return err
 	}
+	pepper, err := loadOrCreateInvitePepper(f.stateDir)
+	if err != nil {
+		return err
+	}
 	st, err := store.Open(filepath.Join(f.stateDir, "relay.db"))
 	if err != nil {
 		return err
 	}
-	defer st.Close()
-
-	var ln net.Listener
-	var who *identity.LocalResolver
-	if f.listen != "" {
-		who = identity.NewLocalResolverAt("")
-		if err := who.Probe(ctx); err != nil {
-			return fmt.Errorf("refusing to start without WhoIs: %w", err)
+	closeStore := sync.OnceFunc(func() {
+		if err := st.Close(); err != nil {
+			log.Printf("close store: %v", err)
 		}
-		ln, err = net.Listen("tcp", listenAt)
-		if err != nil {
-			return err
-		}
-	} else {
-		ts := &tsnet.Server{Hostname: f.hostname, Dir: filepath.Join(f.stateDir, "tsnet"), AuthKey: os.Getenv("TS_AUTHKEY")}
-		defer ts.Close()
-		if _, err := ts.Up(ctx); err != nil {
-			return fmt.Errorf("tsnet up: %w", err)
-		}
-		lc, err := ts.LocalClient()
-		if err != nil {
-			return err
-		}
-		who = identity.NewLocalResolver(lc)
-		ln, err = ts.Listen("tcp", fmt.Sprintf(":%d", f.port))
-		if err != nil {
-			return err
-		}
+	})
+	defer closeStore()
+	approval, err := policy.LoadApproval(filepath.Join(f.stateDir, "approval.json"))
+	if err != nil {
+		return err
 	}
+
+	ln, who, closeNetFn, err := openRelayNet(ctx, f, listenAt)
+	if err != nil {
+		return err
+	}
+	closeNet := sync.OnceFunc(closeNetFn)
+	defer closeNet()
 	if len(f.admins) == 0 {
 		log.Printf("no --admin machines set: invites only work from the local admin socket")
 	}
 
-	dir := identity.NewDirectory(st, identity.WithVirtual(who), f.directoryConfig())
-	srv := relay.New(dir, st, relay.Config{})
-	urls := who.SelfURLs(ctx, f.port)
+	dirCfg := f.directoryConfig()
+	dirCfg.InvitePepper = pepper
+	dir := identity.NewDirectory(st, identity.WithVirtual(who), dirCfg)
+	srv := relay.New(dir, st, f.relayConfig())
+	urls := who.SelfURLs(ctx, advertisePort(listenAt, f.port))
 	srv.SetURLs(urls)
 	log.Printf("tincan relay advertises %s to its agents", strings.Join(urls, ", "))
 	if f.listen != "" {
@@ -186,24 +352,31 @@ func runRelay(ctx context.Context, f relayFlags) error {
 			"Agents with tailscale find it again by themselves; proxy-only agents may need tincan rejoin. "+
 			"Without --listen the relay is its own tailnet node (%s) and keeps its name while --state-dir is kept.", f.hostname)
 	}
-	srv.SetPreparer(policy.New(st, policy.Config{}))
+	srv.SetPreparer(policy.New(st, policy.Config{Approval: approval, UrgentPerHour: f.urgentPerHour}))
 	if f.dist != "" {
 		if fi, err := os.Stat(f.dist); err != nil || !fi.IsDir() {
 			return fmt.Errorf("--dist %s: not a directory", f.dist)
 		}
 		srv.SetDist(f.dist)
 	}
+	ctx, up := withRelayUpgrader(ctx, srv, f)
 	wakeCfg, err := wake.LoadConfig(filepath.Join(f.stateDir, "wake.json"))
 	if err != nil {
 		return err
 	}
-	waker := wake.New(wakeCfg, st, wake.Options{Online: srv.Online, UnseenReplies: srv.UnseenReplies, ReplyGrace: f.replyGrace})
+	waker := wake.New(wakeCfg, st, wake.Options{Online: srv.Online, Queued: srv.QueuedCount, UnseenReplies: srv.UnseenReplies, ReplyGrace: f.replyGrace})
+	defer waker.Stop()
 	srv.SetEvents(waker)
 	srv.SetWakeNamer(waker)
 	if err := resumeReplyWakes(ctx, st, waker); err != nil {
 		log.Printf("reschedule reply wakes: %v", err) // replies stay unseen for the agent's next check
 	}
-	go srv.Run(ctx)
+	if err := resumeRequestWakes(ctx, st, waker); err != nil {
+		log.Printf("reschedule request wakes: %v", err) // requests stay queued for the agent's next check
+	}
+	runCtx, stopRun := context.WithCancel(ctx)
+	defer stopRun()
+	ran := make(chan struct{})
 
 	api := client.Configure(&http.Server{Handler: srv.Handler()}, client.RelayAPI)
 	adminSock := filepath.Join(f.stateDir, "admin.sock")
@@ -217,43 +390,128 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	}
 	admin := client.Configure(&http.Server{Handler: srv.AdminHandler()}, client.RelayAPI)
 
-	errc := make(chan error, 3)
+	errc := make(chan error, 4) // API, admin, gateway and event worker
 	servers := []*http.Server{api, admin}
-	go func() { errc <- api.Serve(ln) }()
-	go func() { errc <- admin.Serve(aln) }()
+	closeGW := func() {}
+	var gatewayServer *http.Server
+	var gatewayNet net.Listener
+	var eventWorker *gateway.EventDeliveryWorker
+	var eventsRan chan struct{}
 	if f.gateway {
-		gln, base, closeGW, err := gatewayListener(ctx, f)
+		gln, base, closeGWFn, err := gatewayListener(ctx, f)
 		if err != nil {
 			return fmt.Errorf("chatgpt gateway: %w", err)
 		}
+		closeGW = sync.OnceFunc(closeGWFn)
 		defer closeGW()
 		oauth, err := gateway.NewOAuth(st.DB(), nil)
 		if err != nil {
 			return err
 		}
+		g := gateway.New(base, oauth, srv.Handler(), Version)
+		if len(f.eventMailboxes) > 0 {
+			if err = oauth.ConfigureEvents(strings.TrimRight(base, "/")+"/mcp", f.eventMailboxes); err != nil {
+				return err
+			}
+			if err = st.InitEvents(); err != nil {
+				return err
+			}
+			sender := gateway.NewWebhookSender()
+			g.ConfigureEventStore(st, sender)
+			eventWorker = gateway.NewEventDeliveryWorker(st, oauth, sender)
+			srv.SetEvents(eventDeliveryHints{base: waker, wake: eventWorker.Wake})
+		}
 		srv.SetConnector(gateway.Connector{Dir: dir, OAuth: oauth, Base: base})
-		gw := client.Configure(&http.Server{Handler: gateway.New(base, oauth, srv.Handler(), Version).Handler()}, client.RelayAPI)
-		go func() { errc <- gw.Serve(gln) }()
+		gw := client.Configure(&http.Server{Handler: g.Handler()}, client.RelayAPI)
+		gatewayServer, gatewayNet = gw, gln
 		servers = append(servers, gw)
 		log.Printf("chatgpt gateway serving at %s/mcp", base)
 	}
+	// Policy, connector and hooks are immutable once listeners or sweep run.
+	// An event login cannot transiently bind as a full virtual agent at startup.
+	go func() { defer close(ran); srv.Run(runCtx) }()
+	if eventWorker != nil {
+		eventsRan = make(chan struct{})
+		go func() {
+			defer close(eventsRan)
+			if err := eventWorker.Run(runCtx); err != nil {
+				select {
+				case errc <- err:
+				case <-runCtx.Done():
+				}
+			}
+		}()
+	}
+	go func() { errc <- api.Serve(ln) }()
+	go func() { errc <- admin.Serve(aln) }()
+	if gatewayServer != nil {
+		go func() { errc <- gatewayServer.Serve(gatewayNet) }()
+	}
 	log.Printf("tincan relay serving on %s (admin socket %s)", ln.Addr(), adminSock)
 
+	var served error
 	select {
 	case <-ctx.Done():
-	case err := <-errc:
-		if !errors.Is(err, http.ErrServerClosed) {
-			return err
+	case served = <-errc:
+		if errors.Is(served, http.ErrServerClosed) {
+			served = nil
 		}
 	}
-	shutdown(servers)
-	return nil
+	// From here a second SIGINT or SIGTERM gets the default handling and
+	// ends the process at once.
+	stop()
+	log.Printf("tincan relay shutting down")
+	var step atomic.Value
+	watchdog := time.AfterFunc(relayExitTimeout, func() {
+		log.Printf("tincan relay: shutdown stuck in %s after %s; exiting now", step.Load(), relayExitTimeout)
+		os.Exit(1)
+	})
+	defer watchdog.Stop()
+	for _, s := range []struct {
+		name string
+		do   func()
+	}{
+		// Held long polls and waits answer "nothing yet" first, so the
+		// drain below only waits for calls that are really working.
+		{"ending held polls", srv.Stop},
+		{"draining connections", func() { shutdown(servers) }},
+		{"stopping sweeps", func() {
+			stopRun()
+			<-ran
+			if eventsRan != nil {
+				<-eventsRan
+			}
+		}},
+		{"stopping wakes", waker.Stop},
+		{"closing the gateway", closeGW},
+		{"closing the tailnet listener", closeNet},
+		{"closing the store", closeStore},
+	} {
+		step.Store(s.name)
+		s.do()
+	}
+	log.Printf("tincan relay stopped")
+	if served != nil {
+		return served
+	}
+	// After tincan relay-upgrade: the store and listeners are closed, so
+	// the caller can now re-exec the new build or exit for a supervisor.
+	return up.restartErr()
 }
 
-// shutdown drains servers gracefully so held long-polls finish rather than
-// being severed on restart, falling back to Close if the drain times out.
+// relayDrainTimeout bounds how long shutdown waits for calls in flight
+// before closing their connections. Held long polls do not count: they
+// answer as soon as shutdown starts.
+var relayDrainTimeout = 10 * time.Second
+
+// relayExitTimeout bounds the whole shutdown. A relay still stuck after it
+// (a tailnet node that will not close, say) logs the step and exits anyway.
+var relayExitTimeout = relayDrainTimeout + 10*time.Second
+
+// shutdown drains servers, closing whatever is still open when
+// relayDrainTimeout runs out.
 func shutdown(servers []*http.Server) {
-	ctx, cancel := context.WithTimeout(context.Background(), client.DefaultPollHold+5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), relayDrainTimeout)
 	defer cancel()
 	var wg sync.WaitGroup
 	for _, s := range servers {
@@ -264,6 +522,48 @@ func shutdown(servers []*http.Server) {
 		})
 	}
 	wg.Wait()
+}
+
+// relayResolver is what the relay needs from its tailnet: caller identity,
+// node liveness for rebinds, and the URLs it advertises.
+type relayResolver interface {
+	identity.Resolver
+	identity.NodeStatus
+	SelfURLs(ctx context.Context, port int) []string
+}
+
+// openRelayNet opens the relay's agent API listener and identity resolver:
+// the host tailnet address through tailscaled with --listen, or its own
+// tsnet node. Tests replace it to serve on loopback with a fake tailnet.
+var openRelayNet = func(ctx context.Context, f relayFlags, listenAt string) (net.Listener, relayResolver, func(), error) {
+	if f.listen != "" {
+		who := identity.NewLocalResolverAt("")
+		if err := who.Probe(ctx); err != nil {
+			return nil, nil, nil, fmt.Errorf("refusing to start without WhoIs: %w", err)
+		}
+		ln, err := net.Listen("tcp", listenAt)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return ln, who, func() {}, nil
+	}
+	ts := &tsnet.Server{Hostname: f.hostname, Dir: filepath.Join(f.stateDir, "tsnet"), AuthKey: os.Getenv("TS_AUTHKEY")}
+	fail := func(err error) (net.Listener, relayResolver, func(), error) {
+		ts.Close()
+		return nil, nil, nil, err
+	}
+	if _, err := ts.Up(ctx); err != nil {
+		return fail(fmt.Errorf("tsnet up: %w", err))
+	}
+	lc, err := ts.LocalClient()
+	if err != nil {
+		return fail(err)
+	}
+	ln, err := ts.Listen("tcp", fmt.Sprintf(":%d", f.port))
+	if err != nil {
+		return fail(err)
+	}
+	return ln, identity.NewLocalResolver(lc), func() { ts.Close() }, nil
 }
 
 // gatewayListener returns the public listener and base URL for the ChatGPT
@@ -305,6 +605,22 @@ func resumeReplyWakes(ctx context.Context, st *store.Store, w *wake.Waker) error
 	}
 	for _, a := range agents {
 		w.ReplyWaiting(a)
+	}
+	return nil
+}
+
+// resumeRequestWakes schedules a request wake for every agent that still has
+// queued requests. A nudge scheduled before a restart lived only in the old
+// process, so without this a webhook or email agent sent a request just
+// before the relay stopped would never be woken for it. Each wake counts the
+// queued requests when it fires and is dropped if a poller took them.
+func resumeRequestWakes(ctx context.Context, st *store.Store, w *wake.Waker) error {
+	agents, err := st.AgentsWithQueuedRequests(ctx)
+	if err != nil {
+		return err
+	}
+	for _, a := range agents {
+		w.RequestsWaiting(a)
 	}
 	return nil
 }

@@ -15,6 +15,8 @@
 //     running Claude Code session.
 //   - command (agent-side): `tincan listen --exec` runs a command.
 //   - none: the agent checks at the start of each turn. ChatGPT.
+//   - schedule (agent-side): the agent checks on its own cron every
+//     interval; the relay reports the interval and a missed check.
 //
 // A reply to an agent's own request also wakes a relay-side agent, after a
 // grace period that lets an inline wait read it first, and only if the reply
@@ -58,6 +60,10 @@ const (
 	Channel = "channel"
 	Command = "command"
 	None    = "none"
+	// Schedule (agent-side): the agent checks its inbox on its own cron
+	// every Target.Every. The relay sends no wake; it reports the interval
+	// and whether the agent has missed its checks.
+	Schedule = "schedule"
 )
 
 // Webhook body formats.
@@ -93,6 +99,9 @@ type Target struct {
 	EmailTo       string `json:"email_to,omitempty"`
 	AgentMailFrom string `json:"agentmail_inbox,omitempty"` // sending inbox, e.g. mvhgrokbot@agentmail.to
 	AgentMailKey  string `json:"agentmail_key,omitempty"`
+
+	// schedule: a Go duration such as "5m", the agent's own check interval.
+	Every string `json:"every,omitempty"`
 
 	// MaxPerHour caps relay-side wakes (e.g. e2b resumes). Default 12.
 	MaxPerHour int `json:"max_per_hour,omitempty"`
@@ -135,6 +144,10 @@ func LoadConfig(path string) (Config, error) {
 		case Email:
 			if t.EmailTo == "" || t.AgentMailFrom == "" || t.AgentMailKey == "" {
 				return nil, fmt.Errorf("wake %s: email needs email_to, agentmail_inbox, agentmail_key", name)
+			}
+		case Schedule:
+			if t.Interval() <= 0 {
+				return nil, fmt.Errorf("wake %s: schedule needs every, a positive duration such as \"5m\" (got %q)", name, t.Every)
 			}
 		case Wait, Channel, Command, None:
 		default:
@@ -179,6 +192,12 @@ type Options struct {
 	AgentMailAPI string        // default https://api.agentmail.to/v0
 	HTTP         *http.Client
 	Online       func(agent string) bool // skip request wakes for agents already polling
+	// Queued counts agent's requests still waiting to be delivered. With
+	// it, a wake skipped because agent looked online is re-checked after
+	// OnlineRecheck and sent if a request is still waiting: a session that
+	// polled a moment ago may have ended without taking it.
+	Queued        func(agent string) int
+	OnlineRecheck time.Duration // default 30s
 	// ReplyGrace is how long a reply may go unread before the asker is
 	// woken; default DefaultReplyGrace.
 	ReplyGrace time.Duration
@@ -202,6 +221,7 @@ type nudge struct {
 	timer    *time.Timer // fires the nudge
 	due      time.Time   // when timer fires (wall clock)
 	retry    int         // next step of Options.ReplyRetries to schedule
+	recheck  bool        // a request wake was skipped as online; count Queued at fire time
 }
 
 // Waker implements relay.Events, relay.Requeuer, relay.Replier and
@@ -220,6 +240,11 @@ type Waker struct {
 	// Waker, not the nudge, because fire removes the nudge it sends.
 	replyGen map[string]uint64
 	wg       sync.WaitGroup
+	// stopped is set by Stop; no nudge is scheduled after it. ctx ends
+	// the nudges in flight when Stop is called.
+	stopped bool
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 // New builds a Waker. audit may be nil.
@@ -229,6 +254,9 @@ func New(cfg Config, audit *store.Store, opts Options) *Waker {
 	}
 	if opts.RetryDelay == 0 {
 		opts.RetryDelay = 5 * time.Second
+	}
+	if opts.OnlineRecheck == 0 {
+		opts.OnlineRecheck = 30 * time.Second
 	}
 	if opts.ReplyGrace == 0 {
 		opts.ReplyGrace = DefaultReplyGrace
@@ -245,7 +273,9 @@ func New(cfg Config, audit *store.Store, opts Options) *Waker {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	return &Waker{cfg: cfg, opts: opts, audit: audit, pending: map[string]*nudge{}, sent: map[string][]time.Time{}, replyGen: map[string]uint64{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Waker{cfg: cfg, opts: opts, audit: audit, pending: map[string]*nudge{}, sent: map[string][]time.Time{}, replyGen: map[string]uint64{},
+		ctx: ctx, cancel: cancel}
 }
 
 // WakeMethod implements relay.WakeNamer: agents see only the method name.
@@ -256,17 +286,36 @@ func (w *Waker) WakeMethod(agent string) string {
 	return None
 }
 
+// Interval is a schedule target's check interval, 0 when Every is empty or
+// does not parse.
+func (t Target) Interval() time.Duration {
+	d, err := time.ParseDuration(t.Every)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// CheckEvery implements relay.Scheduler: a schedule agent's check interval,
+// 0 for an agent on any other method.
+func (w *Waker) CheckEvery(agent string) time.Duration {
+	if t, ok := w.cfg[agent]; ok && t.Method == Schedule {
+		return max(t.Interval(), 0)
+	}
+	return 0
+}
+
 // Queued implements relay.Events. Relay-side methods schedule a debounced
 // nudge; agent-side methods need nothing from the relay.
 func (w *Waker) Queued(_ context.Context, req envelope.Request) {
-	w.schedule(req.To, true)
+	w.schedule(req.To, true, req.Urgent)
 }
 
 // Requeued implements relay.Requeuer. A requeue means the agent's own
 // delivery or claim lease ran out, so a recent poll does not prove a poller
 // holds the request; relay-side methods are nudged without the online check.
 func (w *Waker) Requeued(_ context.Context, req envelope.Request) {
-	w.schedule(req.To, false)
+	w.schedule(req.To, false, req.Urgent)
 }
 
 // Replied implements relay.Replier: it schedules a nudge for the asker,
@@ -293,19 +342,46 @@ func (w *Waker) ReplyWaiting(agent string) {
 	w.arm(agent, w.opts.ReplyGrace)
 }
 
+// RequestsWaiting schedules a debounced nudge for agent's queued requests.
+// A restarted relay calls it for each agent that still has requests waiting,
+// since a nudge the old process had scheduled died with it. The waiting
+// requests are counted when the nudge fires, so one a poller took by then
+// wakes nobody.
+func (w *Waker) RequestsWaiting(agent string) {
+	if !w.relaySide(agent) || w.opts.Queued == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.nudgeFor(agent).recheck = true
+	w.arm(agent, w.opts.Debounce)
+}
+
 // schedule debounces a relay-side nudge for agent. checkOnline skips agents
 // whose poller already has the request.
-func (w *Waker) schedule(agent string, checkOnline bool) {
+func (w *Waker) schedule(agent string, checkOnline, urgent bool) {
 	if !w.relaySide(agent) {
 		return
 	}
-	if checkOnline && w.opts.Online != nil && w.opts.Online(agent) {
-		return // its poller already has it
+	if !urgent && checkOnline && w.opts.Online != nil && w.opts.Online(agent) {
+		// Its poller should have it, but a session that just polled may be
+		// ending: look again later and wake only if it is still waiting.
+		if w.opts.Queued != nil {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			w.nudgeFor(agent).recheck = true
+			w.arm(agent, w.opts.OnlineRecheck)
+		}
+		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.nudgeFor(agent).requests++
-	w.arm(agent, w.opts.Debounce)
+	if urgent {
+		w.arm(agent, 0)
+	} else {
+		w.arm(agent, w.opts.Debounce)
+	}
 }
 
 // relaySide reports whether the relay itself wakes agent.
@@ -329,6 +405,9 @@ func (w *Waker) nudgeFor(agent string) *nudge {
 // later is pulled in, so a request never waits out a reply's grace period.
 // Caller holds w.mu.
 func (w *Waker) arm(agent string, d time.Duration) {
+	if w.stopped {
+		return
+	}
 	p := w.pending[agent]
 	due := time.Now().Add(d)
 	if p.timer != nil {
@@ -348,8 +427,25 @@ func (w *Waker) arm(agent string, d time.Duration) {
 	})
 }
 
-// Flush waits for scheduled nudges (tests and shutdown).
+// Flush waits for scheduled nudges (tests).
 func (w *Waker) Flush() { w.wg.Wait() }
+
+// Stop drops the nudges still waiting for their timers, ends the ones being
+// sent, and waits for them to return. Nothing is scheduled afterwards. The
+// relay calls it on shutdown; a restarted relay schedules wakes again for
+// every request still queued and every reply still unseen.
+func (w *Waker) Stop() {
+	w.mu.Lock()
+	w.stopped = true
+	for _, p := range w.pending {
+		if p.timer != nil && p.timer.Stop() {
+			w.wg.Done() // the stopped timer's callback will never run
+		}
+	}
+	w.mu.Unlock()
+	w.cancel()
+	w.wg.Wait()
+}
 
 func (w *Waker) fire(agent string) {
 	w.mu.Lock()
@@ -359,6 +455,13 @@ func (w *Waker) fire(agent string) {
 	w.mu.Unlock()
 	if p == nil {
 		return
+	}
+	if p.recheck && w.opts.Queued != nil {
+		// Count what is still waiting: zero when a poller took it, and
+		// the whole backlog when requests arrived after the recheck was set.
+		if n := w.opts.Queued(agent); p.requests == 0 || n > p.requests {
+			p.requests = n
+		}
 	}
 	replies := p.replies
 	if w.opts.UnseenReplies != nil {
@@ -372,7 +475,7 @@ func (w *Waker) fire(agent string) {
 		// session cannot read the replies.
 		defer w.retryLater(agent, p.retry, gen)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(w.ctx, 2*time.Minute)
 	defer cancel()
 	w.mu.Lock()
 	allowed := w.allow(agent)
@@ -385,8 +488,11 @@ func (w *Waker) fire(agent string) {
 	key := nudgeKey() // the retry reuses it, so a lost response never runs two turns
 	err := w.send(ctx, agent, msg, key)
 	if err != nil {
-		time.Sleep(w.opts.RetryDelay)
-		err = w.send(ctx, agent, msg, key)
+		select {
+		case <-time.After(w.opts.RetryDelay):
+			err = w.send(ctx, agent, msg, key)
+		case <-ctx.Done():
+		}
 	}
 	if err != nil {
 		log.Printf("wake %s: %v", agent, err)
@@ -553,10 +659,17 @@ func (w *Waker) do(req *http.Request) error {
 	return nil
 }
 
+// auditTimeout bounds one wake audit write.
+const auditTimeout = 10 * time.Second
+
 func (w *Waker) record(ctx context.Context, event, agent, detail string) {
 	if w.audit == nil {
 		return
 	}
+	// The audit write outlives a nudge cut short by Stop, within its own
+	// bound so it cannot hold Stop up.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditTimeout)
+	defer cancel()
 	if err := w.audit.Audit(ctx, store.AuditEvent{Event: event, Actor: agent, Detail: detail}); err != nil {
 		log.Printf("audit %s: %v", event, err)
 	}

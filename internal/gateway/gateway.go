@@ -31,6 +31,7 @@ type Gateway struct {
 	mu       sync.Mutex
 	failures []time.Time // recent bad login codes, for lockout
 	servers  sync.Map    // agent name -> *mcp.Server, built once per agent
+	events   *eventService
 }
 
 // New builds a gateway. relay is the relay's agent API handler; requests are
@@ -50,7 +51,10 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("GET /authorize", g.authorizePage)
 	mux.HandleFunc("POST /authorize", g.authorizeSubmit)
 	mux.HandleFunc("POST /token", g.token)
-	mux.Handle("/mcp", g.requireToken(mcp.NewStreamableHTTPHandler(g.serverFor, &mcp.StreamableHTTPOptions{Stateless: true})))
+	mux.HandleFunc("POST /revoke", g.revokeToken)
+	mcpHandler := mcp.NewStreamableHTTPHandler(g.serverFor, &mcp.StreamableHTTPOptions{Stateless: true})
+	discovery := mcp.NewStreamableHTTPHandler(g.serverFor, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
+	mux.Handle("/mcp", g.requireToken(g.eventDispatch(mcpHandler, discovery)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		client.LimitBody(w, r, client.Defaults(client.RelayAPI).MaxBodyBytes)
 		mux.ServeHTTP(w, r)
@@ -58,20 +62,23 @@ func (g *Gateway) Handler() http.Handler {
 }
 
 type agentKey struct{}
+type principalKey struct{}
 
 func (g *Gateway) requireToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		agent, err := "", error(nil)
+		principal, err := Principal{}, error(nil)
 		if ok {
-			agent, err = g.oauth.Validate(r.Context(), strings.TrimSpace(tok))
+			principal, err = g.oauth.ValidatePrincipal(r.Context(), strings.TrimSpace(tok), g.base+"/mcp")
 		}
 		if !ok || err != nil {
 			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+g.base+`/.well-known/oauth-protected-resource"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), agentKey{}, agent)))
+		ctx := context.WithValue(r.Context(), agentKey{}, principal.Agent)
+		ctx = context.WithValue(ctx, principalKey{}, principal)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -79,11 +86,17 @@ func (g *Gateway) requireToken(next http.Handler) http.Handler {
 // token's agent, building it on first use.
 func (g *Gateway) serverFor(r *http.Request) *mcp.Server {
 	agent, _ := r.Context().Value(agentKey{}).(string)
-	if s, ok := g.servers.Load(agent); ok {
+	p, _ := r.Context().Value(principalKey{}).(Principal)
+	key := p.Scope + ":" + agent
+	if s, ok := g.servers.Load(key); ok {
+		return s.(*mcp.Server)
+	}
+	if p.Scope == ScopeEvents {
+		s, _ := g.servers.LoadOrStore(key, mcp.NewServer(&mcp.Implementation{Name: "tincan-events", Version: g.version}, &mcp.ServerOptions{Capabilities: &mcp.ServerCapabilities{}}))
 		return s.(*mcp.Server)
 	}
 	rc := client.NewRelayHTTP("http://tincan-relay", &http.Client{Transport: inProcess{h: g.relay, addr: identity.VirtualAddr(agent)}})
-	s, _ := g.servers.LoadOrStore(agent, mcpserver.New(rc, g.version))
+	s, _ := g.servers.LoadOrStore(key, mcpserver.New(rc, g.version))
 	return s.(*mcp.Server)
 }
 
@@ -112,14 +125,16 @@ func (g *Gateway) protectedResource(w http.ResponseWriter, _ *http.Request) {
 
 func (g *Gateway) authServer(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"issuer":                                g.base,
-		"authorization_endpoint":                g.base + "/authorize",
-		"token_endpoint":                        g.base + "/token",
-		"registration_endpoint":                 g.base + "/register",
-		"response_types_supported":              []string{"code"},
-		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
-		"code_challenge_methods_supported":      []string{"S256"},
-		"token_endpoint_auth_methods_supported": []string{"none"},
+		"issuer":                 g.base,
+		"authorization_endpoint": g.base + "/authorize",
+		"token_endpoint":         g.base + "/token",
+		"revocation_endpoint":    g.base + "/revoke",
+		"revocation_endpoint_auth_methods_supported": []string{"none"},
+		"registration_endpoint":                      g.base + "/register",
+		"response_types_supported":                   []string{"code"},
+		"grant_types_supported":                      []string{"authorization_code", "refresh_token"},
+		"code_challenge_methods_supported":           []string{"S256"},
+		"token_endpoint_auth_methods_supported":      []string{"none"},
 	})
 }
 
@@ -190,10 +205,11 @@ var loginPage = template.Must(template.New("login").Parse(`<!doctype html>
 <input type="hidden" name="redirect_uri" value="{{.Redirect}}">
 <input type="hidden" name="code_challenge" value="{{.Challenge}}">
 <input type="hidden" name="state" value="{{.State}}">
+<input type="hidden" name="resource" value="{{.Resource}}">
 <button type="submit">Connect</button></form></body></html>`))
 
 type authReq struct {
-	ClientID, Redirect, Challenge, State, Error string
+	ClientID, Redirect, Challenge, State, Error, Resource string
 }
 
 func (g *Gateway) checkAuthReq(ctx context.Context, a authReq, method string) string {
@@ -212,7 +228,7 @@ func (g *Gateway) checkAuthReq(ctx context.Context, a authReq, method string) st
 
 func (g *Gateway) authorizePage(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	a := authReq{ClientID: q.Get("client_id"), Redirect: q.Get("redirect_uri"), Challenge: q.Get("code_challenge"), State: q.Get("state")}
+	a := authReq{ClientID: q.Get("client_id"), Redirect: q.Get("redirect_uri"), Challenge: q.Get("code_challenge"), State: q.Get("state"), Resource: q.Get("resource")}
 	if q.Get("response_type") != "code" {
 		http.Error(w, "response_type must be code", http.StatusBadRequest)
 		return
@@ -233,7 +249,7 @@ func (g *Gateway) authorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	a := authReq{ClientID: r.PostForm.Get("client_id"), Redirect: r.PostForm.Get("redirect_uri"), Challenge: r.PostForm.Get("code_challenge"), State: r.PostForm.Get("state")}
+	a := authReq{ClientID: r.PostForm.Get("client_id"), Redirect: r.PostForm.Get("redirect_uri"), Challenge: r.PostForm.Get("code_challenge"), State: r.PostForm.Get("state"), Resource: r.PostForm.Get("resource")}
 	if msg := g.checkAuthReq(r.Context(), a, ""); msg != "" {
 		http.Error(w, msg, http.StatusBadRequest)
 		return
@@ -242,7 +258,7 @@ func (g *Gateway) authorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many wrong codes; wait 10 minutes and mint a new code", http.StatusTooManyRequests)
 		return
 	}
-	code, err := g.oauth.ExchangeLogin(r.Context(), strings.ToUpper(strings.TrimSpace(r.PostForm.Get("login_code"))), a.ClientID, a.Redirect, a.Challenge)
+	code, err := g.oauth.ExchangeLoginResource(r.Context(), strings.ToUpper(strings.TrimSpace(r.PostForm.Get("login_code"))), a.ClientID, a.Redirect, a.Challenge, a.Resource)
 	if err != nil {
 		g.fail()
 		a.Error = "That code is wrong, used, or expired."
@@ -287,9 +303,9 @@ func (g *Gateway) token(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch f.Get("grant_type") {
 	case "authorization_code":
-		t, err = g.oauth.ExchangeAuthCode(r.Context(), f.Get("code"), f.Get("client_id"), f.Get("redirect_uri"), f.Get("code_verifier"))
+		t, err = g.oauth.ExchangeAuthCodeResource(r.Context(), f.Get("code"), f.Get("client_id"), f.Get("redirect_uri"), f.Get("code_verifier"), f.Get("resource"))
 	case "refresh_token":
-		t, err = g.oauth.Refresh(r.Context(), f.Get("refresh_token"), f.Get("client_id"))
+		t, err = g.oauth.RefreshResource(r.Context(), f.Get("refresh_token"), f.Get("client_id"), f.Get("resource"))
 	default:
 		oauthErr(w, "unsupported_grant_type", "")
 		return
@@ -304,6 +320,23 @@ func (g *Gateway) token(w http.ResponseWriter, r *http.Request) {
 
 func oauthErr(w http.ResponseWriter, code, desc string) {
 	oauthErrStatus(w, http.StatusBadRequest, code, desc)
+}
+
+func (g *Gateway) revokeToken(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		oauthErr(w, "invalid_request", "bad form")
+		return
+	}
+	if r.PostForm.Get("token") == "" || r.PostForm.Get("client_id") == "" {
+		oauthErr(w, "invalid_request", "token and client_id required")
+		return
+	}
+	if err := g.oauth.RevokeToken(r.Context(), r.PostForm.Get("token"), r.PostForm.Get("client_id")); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
 }
 
 func oauthErrStatus(w http.ResponseWriter, status int, code, desc string) {
@@ -325,8 +358,16 @@ type Connector struct {
 
 // Connect binds the virtual agent and mints a login code.
 func (c Connector) Connect(ctx context.Context, name string) (string, string, error) {
-	if err := c.Dir.BindVirtual(ctx, name); err != nil {
-		return "", "", err
+	if c.OAuth.EventsOnly(name) {
+		if _, found, err := c.Dir.Agent(ctx, name); err != nil {
+			return "", "", err
+		} else if !found {
+			return "", "", identity.ErrUnknownAgent
+		}
+	} else {
+		if err := c.Dir.BindVirtual(ctx, name); err != nil {
+			return "", "", err
+		}
 	}
 	code, err := c.OAuth.MintLoginCode(ctx, name)
 	return code, strings.TrimRight(c.Base, "/") + "/mcp", err

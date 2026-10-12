@@ -15,11 +15,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
+	"github.com/mvanhorn/agent-tincan/internal/mcpserver"
 )
 
 func upgradeCmd() *cobra.Command {
 	var relayURL string
-	var check bool
+	var check, force bool
 	cmd := &cobra.Command{
 		Use:   "upgrade",
 		Short: "Replace this tincan binary with the release the relay serves",
@@ -29,7 +30,12 @@ running binary. Agents without GitHub access update this way.
 
 The new binary is written next to the old one and renamed over it, so the old
 file is never modified in place. Long-running tincan processes (wait or listen
-loops, MCP servers) keep running the old build until they are restarted.
+loops, MCP servers) keep running the old build until they are restarted; the
+output names each running tincan mcp on the old build and how its app
+reloads it.
+
+A client newer than the relay's release is left in place, since installing
+the relay's build would downgrade it; pass --force to install it anyway.
 
 With --check, only report the current and available versions.`,
 		Args: cobra.NoArgs,
@@ -52,18 +58,20 @@ With --check, only report the current and available versions.`,
 			if exe, err = filepath.EvalSymlinks(exe); err != nil {
 				return fmt.Errorf("resolve the running tincan binary: %w", err)
 			}
-			return upgrade(cmd.Context(), r, exe, check, cmd.OutOrStdout())
+			return upgrade(cmd.Context(), r, exe, check, force, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(&relayURL, "relay", "", "relay URL (default: saved config)")
 	cmd.Flags().BoolVar(&check, "check", false, "only report the current and available versions; change nothing")
+	cmd.Flags().BoolVar(&force, "force", false, "install the relay's build even when it is older than this one")
 	return cmd
 }
 
 // upgrade replaces the binary at exe with the relay's build for this
 // platform. The binary is untouched unless the download matches the
-// manifest's sha256. check reports without writing anything.
-func upgrade(ctx context.Context, r *client.Relay, exe string, check bool, out io.Writer) error {
+// manifest's sha256. check reports without writing anything. A relay
+// release older than this client is not installed unless force is set.
+func upgrade(ctx context.Context, r *client.Relay, exe string, check, force bool, out io.Writer) error {
 	m, err := r.Dist(ctx)
 	if err != nil {
 		if client.IsStatus(err, 404) {
@@ -89,7 +97,19 @@ func upgrade(ctx context.Context, r *client.Relay, exe string, check bool, out i
 		fmt.Fprintf(out, "tincan %s is up to date (matches the relay's %s build of %s).\n", current, name, available)
 		return nil
 	}
+	if !force && client.Ahead(Version, m.Version) {
+		fmt.Fprintf(out, "tincan %s at %s is newer than the relay's release %s; not replacing it with the older build.\n%s\nTo install the relay's %s anyway, run tincan upgrade --force.\n",
+			current, exe, strings.TrimPrefix(m.Version, "v"), relayBehindAdvice(Version), strings.TrimPrefix(m.Version, "v"))
+		return nil
+	}
 	if check {
+		if client.Ahead(Version, m.Version) {
+			fmt.Fprintf(out, "tincan %s at %s is newer than the relay's release %s; installing it would downgrade.\n%s\n", current, exe, strings.TrimPrefix(m.Version, "v"), relayBehindAdvice(Version))
+			return nil
+		}
+		if client.Newer(m.Version, Version) {
+			fmt.Fprintf(out, "A newer tincan release is available: %s.\n", m.Version)
+		}
 		fmt.Fprintf(out, "Current: tincan %s at %s\nAvailable from the relay: %s (%s)\nRun tincan upgrade to install it.\n", current, exe, available, name)
 		return nil
 	}
@@ -129,10 +149,50 @@ func upgrade(ctx context.Context, r *client.Relay, exe string, check bool, out i
 		return fmt.Errorf("replace %s: %w", exe, err)
 	}
 	done = true
-	fmt.Fprintf(out, "Upgraded %s from tincan %s to %s.\n"+
-		"Restart any long-running tincan processes (tincan wait or listen loops, tincan mcp servers) so they run the new build.\n",
-		exe, current, available)
+	fmt.Fprintf(out, "Upgraded %s from tincan %s to %s.\n", exe, current, available)
+	fmt.Fprint(out, reloadAdvice(mcpserver.ReadLaunches(mcpserver.LaunchDir(client.ConfigPath())), available, mcpserver.LaunchRunning))
 	return nil
+}
+
+// relayBehindAdvice says how to bring a relay up to clientVersion. A bare
+// tincan relay-upgrade installs the relay's own dist release, which is the
+// older one, so the release is fetched from GitHub by tag.
+func relayBehindAdvice(clientVersion string) string {
+	return fmt.Sprintf("To upgrade the relay, ask the owner to run `tincan relay-upgrade --from-github v%s` from an admin device.", strings.TrimPrefix(clientVersion, "v"))
+}
+
+// reloadAdvice tells the agent how to get its long-running tincan processes
+// onto the new build. Each app reloads tincan mcp its own way, so running
+// servers on another build are named with their app's step; with none
+// recorded, the step for every app is listed.
+func reloadAdvice(ls []mcpserver.Launch, newVersion string, running func(mcpserver.Launch) bool) string {
+	var b strings.Builder
+	b.WriteString("Restart any long-running tincan processes (tincan wait or listen loops, tincan mcp servers) so they run the new build.\n")
+	newVersion = strings.TrimPrefix(newVersion, "v")
+	var stale []string
+	for _, l := range ls {
+		if !l.Ended.IsZero() || l.Version == "" || strings.TrimPrefix(l.Version, "v") == newVersion || !running(l) {
+			continue
+		}
+		who := l.Client
+		if who == "" {
+			who = "an app"
+		}
+		kind := mcpserver.HostKind(l.Client)
+		stale = append(stale, fmt.Sprintf("  %s (pid %d, tincan %s): %s\n", who, l.PID, l.Version, mcpserver.ReloadStep(kind)))
+	}
+	if len(stale) > 0 {
+		b.WriteString("These tincan mcp servers still run the build they started with:\n")
+		for _, s := range stale {
+			b.WriteString(s)
+		}
+		return b.String()
+	}
+	b.WriteString("To reload tincan mcp in an app:\n")
+	for _, kind := range []string{mcpserver.HostClaudeCode, mcpserver.HostCodex, mcpserver.HostCursor, mcpserver.HostGeneric} {
+		fmt.Fprintf(&b, "  %s: %s\n", hostLabel(kind), mcpserver.ReloadStep(kind))
+	}
+	return b.String()
 }
 
 func fileSHA256(path string) (string, error) {

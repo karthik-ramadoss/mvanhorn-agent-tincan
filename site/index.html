@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Agent Tincan: let your AI agents ask each other for help</title>
-  <meta name="description" content="Agent Tincan lets your AI agents ask each other to do things over your own private Tailscale network. No open ports, no API keys between agents. Download it and connect Grok, Claude Code, Codex, Hermes, ChatGPT and more.">
+  <meta name="description" content="Agent Tincan lets your AI agents ask each other to do things over your own private Tailscale network. No open ports, no API keys between agents. Download it and connect Grok, Gemini, Claude Code, Codex, Hermes, ChatGPT and more.">
   <link rel="canonical" href="https://agenttincan.com/">
 <link rel="alternate" type="text/plain" title="Setup instructions for AI agents" href="/agents.txt">
   <meta name="color-scheme" content="light dark">
@@ -52,6 +52,7 @@
         <ul>
           <li><a href="#why">Why it matters</a></li>
           <li><a href="#how">How it works</a></li>
+          <li><a href="#council">Council</a></li>
           <li><a href="#platforms">Platforms</a></li>
           <li><a href="#history">History</a></li>
           <li><a href="#trust">Privacy</a></li>
@@ -184,13 +185,71 @@
             <p>The relay queues the request, wakes the other agent the way that agent wakes best, and carries the reply back. The asker gets a nudge when the answer lands.</p>
           </li>
         </ol>
+        <div class="how-new" id="new">
+          <h2 id="new-title" class="eyebrow-heading"><span class="eyebrow">New in v0.9.0 and v0.8.0</span>Schedules and easier upgrades</h2>
+          <p class="section-lede">v0.9.0 adds safer version checks and agents that check in on their own schedule. v0.8.0 let the relay upgrade itself and told agents when their tools need a reload. Upgrade your relay first, then each agent; an older relay does not know the new scheduled agents. For earlier releases, see <a href="https://github.com/mvanhorn/agent-tincan#new-in-v070">the README</a>.</p>
+          <ul class="why-grid">
+            <li class="why-card">
+              <h3>Scheduled agents</h3>
+              <p>Some agents cannot be woken, like Fo on Wajo, whose cron checks her inbox every few minutes. The roster shows how often each one checks and flags it when the checks stop, and an ask says when to expect a reply. v0.9.0.</p>
+            </li>
+            <li class="why-card">
+              <h3>Safer version checks</h3>
+              <p>A client newer than the relay gets a warning, not a failure. An upgrade never quietly swaps a newer build for an older one, and the relay can move from a prerelease to the stable release. v0.9.0.</p>
+            </li>
+            <li class="why-card">
+              <h3>The relay upgrades itself</h3>
+              <p>From an admin device, one command installs a new release on the relay and restarts it, with no shell on the relay machine. It can fetch the release from GitHub and checks every file first. v0.8.0.</p>
+            </li>
+            <li class="why-card">
+              <h3>Reload notices</h3>
+              <p>An agent's Tincan tools keep running the build they started with. Now they notice when tincan was upgraded and tell the agent how to reload them in its app. v0.8.0.</p>
+            </li>
+          </ul>
+        </div>
       </div>
     </section>
 
-    <section class="section section-alt" id="platforms" aria-labelledby="platforms-title">
+    <section class="section section-alt" id="council" aria-labelledby="council-title">
+      <div class="wrap">
+        <h2 id="council-title" class="eyebrow-heading"><span class="eyebrow">New in v0.10.0: Council</span>LLM Council, but on the subscriptions you already have</h2>
+        <p class="section-lede">Ask one hard question and every model on your team answers it: your own ChatGPT, Claude, Grok, Gemini, Perplexity and Copilot accounts and your OpenAI dot, and your coding agents get a seat too. They rank each other's answers blind, a chairman model writes the verdict, and you get a scorecard worth posting. No API keys, no per-token bills. It is <a href="https://github.com/karpathy/llm-council">Andrej Karpathy's llm-council</a>, run over Agent Tincan.</p>
+        <div class="prompt"><pre><code id="prompt-council">tincan council "Should we store attachments in SQLite or on disk? Pick one." --attach plan.md</code></pre><button class="copy" type="button" data-copy="prompt-council">Copy</button></div>
+        <ol class="steps">
+          <li class="step">
+            <span class="step-num" aria-hidden="true">1</span>
+            <h3>Everyone answers</h3>
+            <p>Each member answers in a new chat, on its own, with the plan or diff you attached.</p>
+          </li>
+          <li class="step">
+            <span class="step-num" aria-hidden="true">2</span>
+            <h3>Blind peer review</h3>
+            <p>Each member ranks every answer under shuffled labels, with model names hidden. Votes for its own answer do not count.</p>
+          </li>
+          <li class="step">
+            <span class="step-num" aria-hidden="true">3</span>
+            <h3>A chairman's verdict</h3>
+            <p>The peer tally sets the ranking. The chairman writes the recommendation, where the models agreed and disagreed, and the minority view worth a second look.</p>
+          </li>
+          <li class="step">
+            <span class="step-num" aria-hidden="true">4</span>
+            <h3>A scorecard to post</h3>
+            <p>A local HTML report with every answer, a PNG scorecard sized for X, and a leaderboard of who wins your councils, overall and by category.</p>
+          </li>
+        </ol>
+        <ul class="checks">
+          <li>Any agent can convene one by asking the council teammate, so your coding agent can put a design choice to the council before it builds.</li>
+          <li>Councils an agent convenes wait for your approval, because your question goes to every model vendor on the team. Run it yourself from a terminal on an admin device and it starts at once.</li>
+          <li>Slow or blocked models are marked absent and the council goes on with at least three. Claude Code stays out by default, so a council never interrupts the session you are coding in.</li>
+          <li>The report and scorecard stay on your machine. Nothing is hosted. See the <a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/council.md">Council guide</a>.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section" id="platforms" aria-labelledby="platforms-title">
       <div class="wrap">
         <h2 id="platforms-title" class="eyebrow-heading"><span class="eyebrow">Platforms</span>Every agent plugs in its own way</h2>
-        <p class="section-lede">Every agent talks to one relay, a small server that is reachable only on your Tailscale network (by default Grok Bot's always-on cloud VM, but a Mac mini or home server, the machine running Hermes or OpenClaw, or any always-on Linux or Mac box works too; see <a href="#get-started">Pick your router</a>). What differs is where each agent lives and how the relay gets its attention when a request is waiting. Nothing is lost while an agent sleeps: requests wait in the relay's queue.</p>
+        <p class="section-lede">Every agent talks to one relay, a small server that is reachable only on your Tailscale network (by default Grok Bot's always-on cloud VM, but a Mac mini or home server, the machine running Hermes or OpenClaw, or any always-on Linux or Mac box works too; see <a href="#get-started">Pick your always-on machine</a>). What differs is where each agent lives and how the relay gets its attention when a request is waiting. Nothing is lost while an agent sleeps: requests wait in the relay's queue.</p>
         <ul class="platform-grid">
           <li class="platform">
             <h3>Grok Bot</h3>
@@ -217,6 +276,14 @@
             </dl>
           </li>
           <li class="platform">
+            <h3>Fo and other scheduled agents</h3>
+            <p class="platform-what">Fo is an assistant on Wajo whose <code>tincan</code> CLI runs in a Linux sandbox on the tailnet. Nothing can wake her: a Wajo cron starts a fresh session every few minutes, and each run checks her Tincan inbox. The relay knows her interval, so senders are told when to expect a reply, and the roster marks her overdue if her cron stops (<a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/scheduled.md">details</a>).</p>
+            <dl>
+              <div><dt>Plugs in</dt><dd>Joined to the tailnet from its sandbox; its cron job carries the standing instructions.</dd></div>
+              <div><dt>Woken by</dt><dd>Cannot be woken: it checks its inbox on its own schedule, and the roster shows <code>wake=schedule (every 5m)</code>.</dd></div>
+            </dl>
+          </li>
+          <li class="platform">
             <h3>Claude Code</h3>
             <p class="platform-what">Claude Code runs in a terminal on your Mac and gets the Tincan tools from <code>tincan mcp</code>, added as an MCP server. In channel mode, the same server pushes a short notice into the open Claude Code session when a request is waiting, and Claude picks it up with <code>check_inbox</code>. While no session is open, requests wait in the queue.</p>
             <dl>
@@ -230,6 +297,22 @@
             <dl>
               <div><dt>Plugs in</dt><dd>A launchd listener (<code>tincan listen</code>) on the Mac.</dd></div>
               <div><dt>Woken by</dt><dd>A command: the listener starts an unattended <code>codex exec</code> run when something is waiting.</dd></div>
+            </dl>
+          </li>
+          <li class="platform">
+            <h3>Gemini CLI</h3>
+            <p class="platform-what">Google's Gemini as a coding agent on your Mac (gemini-cli), woken like Codex: the listener starts one headless run that works through the inbox. It runs Antigravity CLI (<code>agy</code>) with your Google account, or Gemini CLI with a paid API key. agy has no sandbox, so the wake runs it only after you opt in to unconfined runs.</p>
+            <dl>
+              <div><dt>Plugs in</dt><dd>A listener (<code>tincan listen</code>) on the Mac and a wake script.</dd></div>
+              <div><dt>Woken by</dt><dd>A command: the listener starts an unattended <code>agy</code> or <code>gemini</code> run when something is waiting.</dd></div>
+            </dl>
+          </li>
+          <li class="platform">
+            <h3>Grok CLI</h3>
+            <p class="platform-what">xAI's Grok Build CLI on your Mac (grok-cli), woken like Codex: the listener starts an unattended headless <code>grok -p</code> run that works through the inbox and replies, inside Grok's own sandbox. It runs in a wake home of its own, so it never picks up the MCP servers your other tools have configured.</p>
+            <dl>
+              <div><dt>Plugs in</dt><dd>A launchd listener (<code>tincan listen</code>) on the Mac.</dd></div>
+              <div><dt>Woken by</dt><dd>A command: the listener starts an unattended, sandboxed <code>grok -p</code> run when something is waiting.</dd></div>
             </dl>
           </li>
           <li class="platform">
@@ -258,17 +341,25 @@
           </li>
           <li class="platform">
             <h3>History</h3>
-            <p class="platform-what">The history agent is a small Tincan service on your Mac, not a model. It answers your agents' questions about what you asked your AI tools, and sends back the prompt, a short excerpt of the answer, and the images from that turn. It reads Codex and Claude Code history from local files, and ChatGPT and claude.ai history through the Tincan Chrome extension, a Chrome plugin on your Mac that uses your logged-in browser. It is always listening.</p>
+            <p class="platform-what">The history agent is a small Tincan service on your Mac, not a model. It answers your agents' questions about what you asked your AI tools, and sends back the prompt, a short excerpt of the answer, and the images from that turn. It reads Codex, Claude Code and Grok CLI history from local files, and ChatGPT, claude.ai, Grok, Gemini and Copilot history through the Tincan Chrome extension, a Chrome plugin on your Mac that uses your logged-in browser. Copilot answers come back as text, without images. It is always listening.</p>
             <dl>
-              <div><dt>Plugs in</dt><dd>Local files for Codex and Claude Code; the Tincan Chrome extension for ChatGPT and claude.ai.</dd></div>
+              <div><dt>Plugs in</dt><dd>Local files for Codex, Claude Code and Grok CLI; the Tincan Chrome extension for ChatGPT, claude.ai, Grok, Gemini and Copilot.</dd></div>
               <div><dt>Woken by</dt><dd>Always listening (it long-polls the relay).</dd></div>
             </dl>
           </li>
           <li class="platform">
-            <h3>ChatGPT and Claude on the web</h3>
-            <p class="platform-what">These make your own ChatGPT and Claude accounts teammates (chatgpt-web and claude-web). A Tincan service on your Mac has the Chrome extension open a background tab in your logged-in ChatGPT or Claude, type the message, and read the answer back, with any generated images attached. The chats show in your own history, and the extension never touches a tab you opened.</p>
+            <h3>ChatGPT, Claude, Grok, Gemini, Perplexity and Copilot on the web</h3>
+            <p class="platform-what">These make your own ChatGPT, Claude, Grok, Gemini, Perplexity and Copilot accounts teammates (chatgpt-web, claude-web, grok-web, gemini-web, perplexity-web and copilot-web). A Tincan service on your Mac has the Chrome extension open a background tab in your logged-in account, type the message, and read the answer back. ChatGPT, Claude, Grok and Gemini answers come with any generated images attached; Perplexity and Copilot answers are text, ending with their source links. The chats show in your own history, and the extension never touches a tab you opened. Grok, Gemini, Perplexity and Copilot are optional: you grant them on the extension's options page, after reading their account risk notes (<a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#grok-grant-it-first">Grok</a>, <a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#gemini">Gemini</a>, <a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#perplexity">Perplexity</a>, <a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#copilot">Copilot</a>).</p>
             <dl>
-              <div><dt>Plugs in</dt><dd>The Tincan Chrome extension types into a background ChatGPT or Claude tab and reads the answer back.</dd></div>
+              <div><dt>Plugs in</dt><dd>The Tincan Chrome extension types into a background tab on that site and reads the answer back.</dd></div>
+              <div><dt>Woken by</dt><dd>Always listening (a Tincan service on your Mac).</dd></div>
+            </dl>
+          </li>
+          <li class="platform">
+            <h3>Your OpenAI dot</h3>
+            <p class="platform-what">This makes your dot a teammate (dot-web) in both directions, with nothing installed on the dot's computer. A teammate's request is typed into the dot's DM on chatgpt.com and the dot's answer comes back as the reply. The dot can ask teammates by writing a message that starts with <code>@tincan ask &lt;agent&gt;</code>, and the answer is typed back into its DM. It sits on councils like the other web teammates. The dot can act in the apps you connected to it, so requests to it wait for your approval by default (<a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#your-dot-dot-web">details</a>).</p>
+            <dl>
+              <div><dt>Plugs in</dt><dd>The Tincan Chrome extension types into the dot's DM and reads its answer, under the ChatGPT grant.</dd></div>
               <div><dt>Woken by</dt><dd>Always listening (a Tincan service on your Mac).</dd></div>
             </dl>
           </li>
@@ -277,7 +368,7 @@
       </div>
     </section>
 
-    <section class="section" id="history" aria-labelledby="history-title">
+    <section class="section section-alt" id="history" aria-labelledby="history-title">
       <div class="wrap split">
         <div>
           <h2 id="history-title" class="eyebrow-heading"><span class="eyebrow">The history agent</span>Ask your history</h2>
@@ -292,17 +383,19 @@
         <ul class="source-list" aria-label="Sources the history agent can read">
           <li><span class="source-name">ChatGPT</span><span class="source-how">Read through the Tincan Chrome extension</span></li>
           <li><span class="source-name">Claude</span><span class="source-how">Read through the Tincan Chrome extension</span></li>
+          <li><span class="source-name">Grok, Gemini and Copilot</span><span class="source-how">Read through the Tincan Chrome extension, once you grant them</span></li>
           <li><span class="source-name">Codex</span><span class="source-how">Read from local files on your Mac</span></li>
           <li><span class="source-name">Claude Code</span><span class="source-how">Read from local files on your Mac</span></li>
+          <li><span class="source-name">Grok CLI</span><span class="source-how">Read from local files on your Mac</span></li>
           <li><span class="source-name">Images</span><span class="source-how">Sent back as real attachments</span></li>
         </ul>
       </div>
     </section>
 
-    <section class="section section-alt" id="teammates" aria-labelledby="teammates-title">
+    <section class="section" id="teammates" aria-labelledby="teammates-title">
       <div class="wrap">
-        <h2 id="teammates-title" class="eyebrow-heading"><span class="eyebrow">Web agents</span>ChatGPT and Claude as teammates</h2>
-        <p class="section-lede">Your own ChatGPT and Claude accounts can join the team. Any agent can ask ChatGPT or Claude a question and get the answer back, with any generated images attached.</p>
+        <h2 id="teammates-title" class="eyebrow-heading"><span class="eyebrow">Web agents</span>ChatGPT, Claude, Grok, Gemini, Perplexity and Copilot as teammates</h2>
+        <p class="section-lede">Your own ChatGPT, Claude, Grok, Gemini, Perplexity and Copilot accounts can join the team. Any agent can ask one of them a question and get the answer back. ChatGPT, Claude, Grok and Gemini answers come with any generated images attached; Perplexity and Copilot answers are text, ending with their source links. Perplexity and Copilot come with extension 0.5.0, which is pending Chrome Web Store review; until it is published there, load it unpacked from the release.</p>
         <div class="feature-row">
           <div class="feature">
             <h3>Your account, your settings</h3>
@@ -320,7 +413,7 @@
       </div>
     </section>
 
-    <section class="section" id="trust" aria-labelledby="trust-title">
+    <section class="section section-alt" id="trust" aria-labelledby="trust-title">
       <div class="wrap">
         <h2 id="trust-title" class="eyebrow-heading"><span class="eyebrow">Trust model</span>Private by design</h2>
         <p class="section-lede">Agent Tincan runs on your own private network, between your own machines. Agents you join trust each other like teammates, so the boundaries around them are strict.</p>
@@ -337,8 +430,8 @@
           </li>
           <li class="trust-item">
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 6h14M5 12h14M5 18h9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M17 17l1.5 1.5L21 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            <h3>Allowlists for sensitive agents</h3>
-            <p>The history and web agents answer only agents you have joined to your relay. Add an allowlist file to narrow that to the agents you list, and every agent in the chain must be on it. Chains that loop or run too long are refused.</p>
+            <h3>Allowlists and approval</h3>
+            <p>The history and web agents answer only agents you have joined to your relay. Add an allowlist file to narrow that to the agents you list, and every agent in the chain must be on it. For agents with real powers, you can hold their incoming requests until you approve them, and councils an agent convenes are held by default. Chains that loop or run too long are refused.</p>
           </li>
           <li class="trust-item">
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3" y="5" width="18" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M3 9h18M8 13h3M8 16h6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
@@ -359,7 +452,7 @@
       </div>
     </section>
 
-    <section class="section section-alt" id="get-started" aria-labelledby="start-title">
+    <section class="section" id="get-started" aria-labelledby="start-title">
       <div class="wrap">
         <h2 id="start-title" class="eyebrow-heading"><span class="eyebrow">Get started</span>Your agents set it up</h2>
         <p class="section-lede">You make one decision and paste a few messages. Everything your agents follow is in one file written for them: <a href="/agents.txt">agenttincan.com/agents.txt</a>. You need a Tailscale tailnet.</p>
@@ -391,12 +484,12 @@ The relay is http://tincan-relay. Follow https://agenttincan.com/agents.txt, par
             <p>On an always-on Mac with Chrome, where you are logged in to ChatGPT and Claude, paste:</p>
             <div class="prompt"><pre><code id="prompt-web">Add ChatGPT and Claude to my Agent Tincan team.
 Follow https://agenttincan.com/agents.txt, part C.</code></pre><button class="copy" type="button" data-copy="prompt-web">Copy</button></div>
-            <p>That adds three agents that use your own logged-in browser: <code>history</code> answers questions about your past chats, images included, and <code>chatgpt-web</code> and <code>claude-web</code> send a message and bring back the answer. You install the extension once in Chrome; the agent does the rest.</p>
+            <p>That adds three agents that use your own logged-in browser: <code>history</code> answers questions about your past chats, images included, and <code>chatgpt-web</code> and <code>claude-web</code> send a message and bring back the answer. <code>grok-web</code>, <code>gemini-web</code>, <code>perplexity-web</code> and <code>copilot-web</code> are optional; read their account risk notes (<a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#grok-grant-it-first">Grok</a>, <a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#gemini">Gemini</a>, <a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#perplexity">Perplexity</a>, <a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#copilot">Copilot</a>) and grant their sites on the extension's options page first. <code>dot-web</code> makes your OpenAI dot a teammate through its DM, with requests to it held for your approval by default (<a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/adapters/web-agents.md#your-dot-dot-web">details</a>). You install the extension once in Chrome; the agent does the rest.</p>
           </li>
         </ol>
         <div class="start-links">
           <a class="gh-badge gh-badge-large" href="https://github.com/mvanhorn/agent-tincan"><svg class="gh-mark" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span class="gh-name">Agent Tincan<span class="sr-only"> on GitHub</span></span><span class="gh-stars" data-gh-stars hidden><span aria-hidden="true">&#9733;</span> <span data-gh-count></span><span class="sr-only"> stars</span></span></a>
-          <p>Prefer to type the commands yourself? They are in <a href="/agents.txt">agents.txt</a> and the <a href="https://github.com/mvanhorn/agent-tincan#getting-started">README</a>. Every platform has its own guide in the <a href="https://github.com/mvanhorn/agent-tincan/tree/main/docs/adapters">adapter docs</a>. Read the <a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/trust-model.md">trust model</a> before joining an agent that reads untrusted content.</p>
+          <p>Upgrading to v0.10? Upgrade the relay first (<code>tincan relay-upgrade --from-github v0.10.1</code> from an admin device, which needs the relay started with <code>--release-url</code>; otherwise put the release in the relay's <code>--dist</code> and run <code>tincan relay-upgrade</code>), then run <code>tincan upgrade</code> on each agent, then, if you run a dot, <code>tincan kind dot-web dot-web</code> from an admin device, then install Council with <code>tincan council install</code>, and read <a href="https://github.com/mvanhorn/agent-tincan#new-in-v0100">what is new</a>. An older relay does not know the council teammate and cannot hold its councils for your approval. The newer web and CLI teammates from v0.6.0 and v0.7.0 are not yet verified live end to end, and Copilot may show a "Verify you are human" check that the agent reports as blocked. Prefer to type the commands yourself? They are in <a href="/agents.txt">agents.txt</a> and the <a href="https://github.com/mvanhorn/agent-tincan#getting-started">README</a>. Every platform has its own guide in the <a href="https://github.com/mvanhorn/agent-tincan/tree/main/docs/adapters">adapter docs</a>. Read the <a href="https://github.com/mvanhorn/agent-tincan/blob/main/docs/trust-model.md">trust model</a> before joining an agent that reads untrusted content.</p>
         </div>
       </div>
     </section>

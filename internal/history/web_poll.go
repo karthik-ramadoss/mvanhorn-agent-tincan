@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/mvanhorn/agent-tincan/internal/client"
 )
 
 // DefaultWebPollSchedule is how the conversation is read while the reply
@@ -28,6 +30,34 @@ const (
 	DefaultClaudeStableFor   = 10 * time.Second
 )
 
+// DefaultGeminiStablePolls and DefaultGeminiStableFor: Gemini's detail
+// has no finished marker, and Gemini can hold its text still for a long
+// while as it thinks or searches mid-answer, so its reply counts as
+// finished only once the same text is read on 4 consecutive polls
+// spanning at least 45 seconds (claude.ai's window is 10).
+const (
+	DefaultGeminiStablePolls = 4
+	DefaultGeminiStableFor   = 45 * time.Second
+)
+
+// DefaultCopilotStablePolls and DefaultCopilotStableFor: Copilot's page
+// JSON marks no answer finished, and a web search can hold its text still
+// mid-answer, so a reply counts as finished once the same text is read on
+// 3 consecutive polls spanning at least 20 seconds.
+const (
+	DefaultCopilotStablePolls = 3
+	DefaultCopilotStableFor   = 20 * time.Second
+)
+
+// DefaultDotStablePolls and DefaultDotStableFor: a dot's DM marks no
+// answer finished, and a dot can answer in several messages a while
+// apart, so its reply counts as finished once the same run of dot
+// messages is read on 3 consecutive polls spanning at least 45 seconds.
+const (
+	DefaultDotStablePolls = 3
+	DefaultDotStableFor   = 45 * time.Second
+)
+
 // A 429 while waiting for a reply waits the site's Retry-After, or backs
 // off from RateLimitBackoffStart, doubling up to RateLimitBackoffMax.
 const (
@@ -38,12 +68,6 @@ const (
 // maxErrorBackoff caps the backoff after other transient read failures
 // (an HTTP 5xx, a flaky read).
 const maxErrorBackoff = 2 * time.Minute
-
-// DefaultPresenceInterval is how often a web agent busy with a request
-// tells the relay it is still there (a peek that claims nothing), so it
-// does not show offline during a long wait. It is well inside the relay's
-// online window (its poll hold plus 30s).
-const DefaultPresenceInterval = 30 * time.Second
 
 // webClock is the reply wait's time source.
 type webClock interface {
@@ -77,34 +101,9 @@ func (w *WebAgent) clk() webClock {
 // keepPresence refreshes the agent's relay presence every
 // PresenceInterval until the returned stop is called. While a request
 // waits minutes for its reply the agent is not long-polling and would
-// otherwise show offline. The refresh is a peek with no hold, which claims
-// nothing, so requests that arrive meanwhile stay queued for the next
-// poll.
+// otherwise show offline. See client.Relay.KeepPresence.
 func (w *WebAgent) keepPresence(ctx context.Context) (stop func()) {
-	every := w.PresenceInterval
-	if every <= 0 {
-		every = DefaultPresenceInterval
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		t := time.NewTicker(every)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				pctx, pcancel := context.WithTimeout(ctx, 15*time.Second)
-				if _, err := w.Relay.Peek(pctx, 0); err != nil && ctx.Err() == nil {
-					w.logf("presence: %v", err)
-				}
-				pcancel()
-			}
-		}
-	}()
-	return func() { cancel(); <-done }
+	return w.Relay.KeepPresence(ctx, client.Presence{Every: w.PresenceInterval, Logf: w.logf})
 }
 
 // pollDelay is the wait before the next detail read once reads have
@@ -126,11 +125,29 @@ func rateLimitBackoff(n int) time.Duration {
 	return min(d, RateLimitBackoffMax)
 }
 
+// stableRule is the site's text-stability rule with the agent's
+// overrides, or nil when the site has none.
+func (w *WebAgent) stableRule() *stableRule {
+	site := w.site().stable
+	if site == nil {
+		return nil
+	}
+	r := *site
+	if w.ClaudeStablePolls > 0 {
+		r.polls = w.ClaudeStablePolls
+	}
+	if w.ClaudeStableFor > 0 {
+		r.span = w.ClaudeStableFor
+	}
+	return &r
+}
+
 // waitReply reads the conversation on the poll schedule until the reply
 // to this request's message is finished, and returns that read and the id
-// of this request's user message. A claude.ai reply without a stop_reason
-// counts as finished once the same reply is read on ClaudeStablePolls
-// consecutive polls spanning at least ClaudeStableFor. onBind, when set,
+// of this request's user message. On a site with a text-stability rule
+// (claude.ai, Gemini, Copilot), a reply without a stop_reason counts as finished once the
+// same reply is read on the rule's number of consecutive polls spanning
+// at least its time (see stableRule). onBind, when set,
 // is called once with the user message id when it is first seen. Errors
 // that will not clear (logged out, the API changed, the extension gone)
 // end the wait at once, as does a later user turn with no reply to this
@@ -145,14 +162,7 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 	if dl, ok := ctx.Deadline(); ok {
 		budgetEnd = clock.Now().Add(time.Until(dl))
 	}
-	stablePolls := w.ClaudeStablePolls
-	if stablePolls <= 0 {
-		stablePolls = DefaultClaudeStablePolls
-	}
-	stableFor := w.ClaudeStableFor
-	if stableFor <= 0 {
-		stableFor = DefaultClaudeStableFor
-	}
+	stable := w.stableRule()
 	op := w.live().detailOp
 	prev, seen := "", 0
 	var first time.Time
@@ -176,6 +186,9 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 			limited, failures = 0, 0
 			delay = w.pollDelay(reads)
 			p, perr := w.progress(raw, a)
+			if errors.Is(perr, errThreadTooLong) {
+				return nil, a.bound, perr
+			}
 			if perr != nil {
 				return nil, a.bound, unavailable(w.Site, ErrEndpointChanged, "unexpected conversation shape")
 			}
@@ -188,15 +201,29 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 			if p.orphaned {
 				return nil, a.bound, errOrphaned
 			}
+			if p.limited {
+				// The turn ended on the account's rate or plan limit with
+				// no answer to deliver (progressOf sets limited only then;
+				// an answer that carries a stray limit error is returned
+				// as usual): the site is left alone for a while, and the
+				// asker is told the message went through.
+				after := w.site().planLimitCooldown
+				if after <= 0 {
+					after = RateLimitBackoffMax
+				}
+				w.Native.cooldown().Note(w.Site, after)
+				w.logf("conversation %s: %s answered with a rate or plan limit; holding requests back for %s", convID, siteLabel(w.Site), after)
+				return nil, a.bound, &UnavailableError{Source: w.Site, Kind: ErrRateLimited, Detail: "plan limit", RetryAfter: after}
+			}
 			if p.finished {
 				return raw, a.bound, nil
 			}
 			switch {
-			case !p.found || w.Site != SourceClaudeAI:
+			case !p.found || stable == nil:
 				prev, seen = "", 0
 			case p.sig == prev:
 				seen++
-				if seen >= stablePolls && clock.Now().Sub(first) >= stableFor {
+				if seen >= stable.polls && clock.Now().Sub(first) >= stable.span {
 					return raw, a.bound, nil
 				}
 			default:
@@ -215,7 +242,8 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 			}
 			w.logf("conversation %s: detail: %v (rate limited; next read in %s)", convID, err, after)
 			delay = after
-		case errors.Is(err, ErrNotLoggedIn), errors.Is(err, ErrEndpointChanged), errors.Is(err, ErrExtensionNotConnected), errors.Is(err, ErrChromeNotRunning), errors.Is(err, ErrRejected):
+		case errors.Is(err, ErrNotLoggedIn), errors.Is(err, ErrEndpointChanged), errors.Is(err, ErrExtensionNotConnected), errors.Is(err, ErrChromeNotRunning), errors.Is(err, ErrRejected),
+			errors.Is(err, ErrPermissionMissing), errors.Is(err, ErrBlocked), errors.Is(err, ErrPaused):
 			return nil, a.bound, err
 		default:
 			failures++

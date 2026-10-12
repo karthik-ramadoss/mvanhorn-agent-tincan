@@ -106,6 +106,10 @@ type ServiceOptions struct {
 	ClaudeDir string
 	// UID fills the printed launchctl command (default: os.Getuid()).
 	UID int
+	// Thread is a web agent's fixed thread (--thread), for a site whose
+	// agent serves one (dots); InstallWebService requires it there and
+	// refuses it elsewhere.
+	Thread string
 }
 
 // ServiceResult says what InstallService wrote and the command that
@@ -118,18 +122,16 @@ type ServiceResult struct {
 // InstallService writes the history service definition: a launchd agent
 // on macOS, a systemd user unit on Linux. It does not load or enable it.
 func InstallService(o ServiceOptions) (ServiceResult, error) {
-	if err := o.fill(); err != nil {
-		return ServiceResult{}, err
+	goos := o.GOOS
+	if goos == "" {
+		goos = runtime.GOOS
 	}
-	o.findTools()
-	path := servicePath(o.GOOS, o.Home, o.CodexDir, o.ClaudeDir)
-	return installServiceDef(o, serviceDef{
-		label:       ServiceLabel,
-		unit:        systemdUnit,
-		launchd:     launchdTemplate,
-		systemd:     systemdTemplate,
-		vars:        []string{"__TINCAN_BINARY__", o.Binary, "__HOME__", o.Home, "__PATH__", path},
-		unsupported: "no history service definition for " + o.GOOS + "; run tincan history serve under your own service manager",
+	return InstallServiceDef(o, ServiceDef{
+		Label:       ServiceLabel,
+		Unit:        systemdUnit,
+		Launchd:     launchdTemplate,
+		Systemd:     systemdTemplate,
+		Unsupported: "no history service definition for " + goos + "; run tincan history serve under your own service manager",
 	})
 }
 
@@ -185,6 +187,35 @@ func validateServiceBinary(b string) error {
 		return fmt.Errorf("service binary %q must be an absolute path without quotes, %% or newlines", b)
 	}
 	return nil
+}
+
+// ServiceDef is another package's service definition for InstallServiceDef.
+// Its templates may use __TINCAN_BINARY__, __HOME__ and __PATH__, filled in
+// from the options, and the placeholder/value pairs in Vars.
+type ServiceDef struct {
+	Label, Unit      string
+	Launchd, Systemd string
+	Vars             []string
+	Unsupported      string
+}
+
+// InstallServiceDef writes d the way InstallService writes the history
+// service: a launchd agent on macOS, a systemd user unit on Linux, with the
+// same PATH. It does not load or enable it.
+func InstallServiceDef(o ServiceOptions, d ServiceDef) (ServiceResult, error) {
+	if err := o.fill(); err != nil {
+		return ServiceResult{}, err
+	}
+	o.findTools()
+	path := servicePath(o.GOOS, o.Home, o.CodexDir, o.ClaudeDir)
+	return installServiceDef(o, serviceDef{
+		label:       d.Label,
+		unit:        d.Unit,
+		launchd:     d.Launchd,
+		systemd:     d.Systemd,
+		vars:        append([]string{"__TINCAN_BINARY__", o.Binary, "__HOME__", o.Home, "__PATH__", path}, d.Vars...),
+		unsupported: d.Unsupported,
+	})
 }
 
 // serviceDef is one service definition: its launchd label and plist
@@ -310,7 +341,7 @@ const webLaunchdTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     <string>web</string>
     <string>serve</string>
     <string>--site</string>
-    <string>__SITE__</string>
+    <string>__SITE__</string>__THREADARGS__
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -341,7 +372,7 @@ Description=Agent Tincan web agent (__AGENT__)
 After=network-online.target
 
 [Service]
-ExecStart="__TINCAN_BINARY__" web serve --site __SITE__
+ExecStart="__TINCAN_BINARY__" web serve --site __SITE____THREADARGS__
 Environment=TINCAN_CONFIG=%h/.config/tincan/__AGENT__.json
 Environment="PATH=__PATH__"
 Restart=always
@@ -361,18 +392,36 @@ func InstallWebService(site Source, o ServiceOptions) (ServiceResult, error) {
 	if _, err := ParseWebSite(string(site)); err != nil {
 		return ServiceResult{}, err
 	}
-	if err := o.fill(); err != nil {
-		return ServiceResult{}, err
+	goos := o.GOOS
+	if goos == "" {
+		goos = runtime.GOOS
 	}
+	// A fixed thread goes into the definition as --thread <id>; the id
+	// is checked to hex and hyphens, and filled (escaped) like any value.
+	launchd, systemd := webLaunchdTemplate, webSystemdTemplate
+	launchdThread, systemdThread := "", ""
+	thread := ""
+	switch {
+	case WebSiteTakesThread(site):
+		id, ok := ParseWebThread(site, o.Thread)
+		if !ok {
+			return ServiceResult{}, fmt.Errorf("--site %s needs --thread <id>, the id in https://chatgpt.com/dots/<id> (got %q)", site, o.Thread)
+		}
+		thread = id
+		launchdThread = "\n    <string>--thread</string>\n    <string>__THREAD__</string>"
+		systemdThread = " --thread __THREAD__"
+	case o.Thread != "":
+		return ServiceResult{}, fmt.Errorf("--thread applies only to --site dots, not %s", site)
+	}
+	launchd = strings.Replace(launchd, "__THREADARGS__", launchdThread, 1)
+	systemd = strings.Replace(systemd, "__THREADARGS__", systemdThread, 1)
 	agent := WebAgentName(site)
-	o.findTools()
-	path := servicePath(o.GOOS, o.Home, o.CodexDir, o.ClaudeDir)
-	return installServiceDef(o, serviceDef{
-		label:       WebServiceLabel(site),
-		unit:        "tincan-" + agent + ".service",
-		launchd:     webLaunchdTemplate,
-		systemd:     webSystemdTemplate,
-		vars:        []string{"__TINCAN_BINARY__", o.Binary, "__HOME__", o.Home, "__PATH__", path, "__SITE__", string(site), "__AGENT__", agent},
-		unsupported: "no web agent service definition for " + o.GOOS + "; run tincan web serve under your own service manager",
+	return InstallServiceDef(o, ServiceDef{
+		Label:       WebServiceLabel(site),
+		Unit:        "tincan-" + agent + ".service",
+		Launchd:     launchd,
+		Systemd:     systemd,
+		Vars:        []string{"__SITE__", string(site), "__AGENT__", agent, "__THREAD__", thread},
+		Unsupported: "no web agent service definition for " + goos + "; run tincan web serve under your own service manager",
 	})
 }

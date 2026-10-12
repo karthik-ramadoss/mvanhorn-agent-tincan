@@ -3,6 +3,8 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -15,6 +17,7 @@ var Version = "0.0.1-dev"
 
 // Root returns the tincan command tree.
 func Root() *cobra.Command {
+	client.Version = Version // every relay call names this build
 	root := &cobra.Command{
 		Use:           "tincan",
 		Short:         "Let AI agents on one tailnet ask each other to do things",
@@ -27,9 +30,40 @@ func Root() *cobra.Command {
 	root.SetOut(os.Stdout)
 	root.AddCommand(relayCmd(), versionCmd())
 	root.AddCommand(agentCmds()...)
-	root.AddCommand(mcpCmd(), doctorCmd(), traceCmd(), auditCmd(), listenCmd(), connectCmd(), onboardCmd(), rejoinCmd(), upgradeCmd(), historyCmd(), webCmd(), attachmentCmd())
+	root.AddCommand(topCmd(), pingCmd(), mcpCmd(), doctorCmd(), traceCmd(), searchCmd(), auditCmd(), listenCmd(), connectCmd(), onboardCmd(), rejoinCmd(), upgradeCmd(), relayUpgradeCmd(), historyCmd(), notesCmd(), councilCmd(), webCmd(), attachmentCmd(), releaseToolsCmd())
 	withRejoinHints(root)
 	return root
+}
+
+// ExitError asks main to exit with Code. A Silent one prints nothing more,
+// for commands whose stdout already says what happened (a --json outcome).
+// Err, when set, is the message main prints for a non-silent one.
+type ExitError struct {
+	Code   int
+	Silent bool
+	Err    error
+}
+
+func (e *ExitError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return fmt.Sprintf("exit status %d", e.Code)
+}
+
+func (e *ExitError) Unwrap() error { return e.Err }
+
+// ExitStatus is the process exit code for err returned by Root, and whether
+// main should print nothing. An ExitError sets its own code, even when
+// wrapped; any other error exits 1 with its message.
+func ExitStatus(err error) (code int, silent bool) {
+	if err == nil {
+		return 0, true
+	}
+	if e, ok := errors.AsType[*ExitError](err); ok {
+		return e.Code, e.Silent
+	}
+	return 1, false
 }
 
 // withRejoinHints makes every client command that fails with "not a joined

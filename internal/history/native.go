@@ -45,6 +45,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -160,13 +161,46 @@ const (
 	OpClaudeAIFile   Op = "claudeai.file"
 	OpChatGPTSend    Op = "chatgpt.send"
 	OpClaudeAISend   Op = "claudeai.send"
+	OpGrokList       Op = "grok.list"
+	OpGrokDetail     Op = "grok.detail"
+	OpGrokFile       Op = "grok.file"
+	OpGrokSend       Op = "grok.send"
 	// The close operations close the tab a send left open for a
 	// conversation, once its reply is finished.
 	OpChatGPTClose  Op = "chatgpt.close"
 	OpClaudeAIClose Op = "claudeai.close"
+	OpGrokClose     Op = "grok.close"
+	// Gemini (gemini.google.com). gemini.file takes the conversation id
+	// and "<response candidate id>-<n>", never a URL.
+	OpGeminiList   Op = "gemini.list"
+	OpGeminiDetail Op = "gemini.detail"
+	OpGeminiFile   Op = "gemini.file"
+	OpGeminiSend   Op = "gemini.send"
+	OpGeminiClose  Op = "gemini.close"
+	// Perplexity (www.perplexity.ai) fronts a web agent only: it has no
+	// list or file operation.
+	OpPerplexityDetail Op = "perplexity.detail"
+	OpPerplexitySend   Op = "perplexity.send"
+	OpPerplexityClose  Op = "perplexity.close"
+	// Copilot (copilot.com). There is no file operation; copilot.list
+	// reads the page's sidebar in a tab the extension opens.
+	OpCopilotList   Op = "copilot.list"
+	OpCopilotDetail Op = "copilot.detail"
+	OpCopilotSend   Op = "copilot.send"
+	OpCopilotClose  Op = "copilot.close"
+	// OpenAI dots (a dot's DM on chatgpt.com, under ChatGPT's grant) front
+	// a web agent only: no list or file operation, and a send always
+	// names the dot's thread.
+	OpDotsDetail Op = "dots.detail"
+	OpDotsSend   Op = "dots.send"
+	OpDotsClose  Op = "dots.close"
 	// OpExtensionReload is sent only by the native host itself, never
 	// relayed from the socket.
 	OpExtensionReload Op = "extension.reload"
+	// OpHostStatus is answered by the native host itself and never
+	// reaches the extension: what the host knows about the connected
+	// extension (ExtensionStatus).
+	OpHostStatus Op = "host.status"
 )
 
 // OpArgs are an operation's arguments: validated ids and integers, a
@@ -191,8 +225,18 @@ func validNativeID(s string) bool { return nativeIDPattern.MatchString(s) }
 // ValidateOp checks op against the fixed set and its arguments against
 // their exact shape: required fields present, others empty.
 func ValidateOp(op Op, a OpArgs) error {
-	switch op {
-	case OpChatGPTSend, OpClaudeAISend:
+	if op == OpExtensionReload {
+		if a != (OpArgs{}) {
+			return fmt.Errorf("%s: takes no arguments", op)
+		}
+		return nil
+	}
+	site, kind, ok := op.resolve()
+	if !ok {
+		return fmt.Errorf("unknown operation %q", op)
+	}
+	switch kind {
+	case opSend:
 		switch {
 		case a.Count != 0 || a.ID != "" || a.FileID != "":
 			return fmt.Errorf("%s: unexpected argument", op)
@@ -206,16 +250,13 @@ func ValidateOp(op Op, a OpArgs) error {
 			return fmt.Errorf("%s: invalid conversation id", op)
 		case a.ConversationID != "" && a.NewChat:
 			return fmt.Errorf("%s: new chat and a conversation id together", op)
+		case site.oneThread && (a.ConversationID == "" || a.NewChat):
+			return fmt.Errorf("%s: needs the thread as its conversation id", op)
 		}
 		return nil
-	case OpChatGPTClose, OpClaudeAIClose:
+	case opClose:
 		if a != (OpArgs{ConversationID: a.ConversationID}) || !validNativeID(a.ConversationID) {
 			return fmt.Errorf("%s: takes only a valid conversation id", op)
-		}
-		return nil
-	case OpExtensionReload:
-		if a != (OpArgs{}) {
-			return fmt.Errorf("%s: takes no arguments", op)
 		}
 		return nil
 	}
@@ -223,17 +264,13 @@ func ValidateOp(op Op, a OpArgs) error {
 		return fmt.Errorf("%s: unexpected argument", op)
 	}
 	needCount, needID, needFile, allowConv := false, false, false, false
-	switch op {
-	case OpChatGPTList, OpClaudeAIList:
+	switch kind {
+	case opList:
 		needCount = true
-	case OpChatGPTDetail, OpClaudeAIDetail:
+	case opDetail:
 		needID = true
-	case OpChatGPTFile:
-		needFile, allowConv = true, true
-	case OpClaudeAIFile:
-		needFile = true
-	default:
-		return fmt.Errorf("unknown operation %q", op)
+	case opFile:
+		needFile, allowConv = true, site.fileTakesConversation
 	}
 	if needCount != (a.Count != 0) || a.Count < 0 || a.Count > MaxListCount {
 		return fmt.Errorf("%s: count must be between 1 and %d", op, MaxListCount)
@@ -250,16 +287,26 @@ func ValidateOp(op Op, a OpArgs) error {
 	return nil
 }
 
+// source is the site op reads or writes, "" for an operation no site has.
 func (op Op) source() Source {
-	if strings.HasPrefix(string(op), "claudeai.") {
-		return SourceClaudeAI
+	if site, _, ok := op.resolve(); ok {
+		return site.source
 	}
-	return SourceChatGPT
+	return ""
 }
 
-func (op Op) file() bool { return op == OpChatGPTFile || op == OpClaudeAIFile }
+// unknownOp refuses an operation no site has. It is not an
+// *UnavailableError: there is no site to attribute it to.
+func unknownOp(op Op) error { return fmt.Errorf("%w: unknown operation %q", ErrRejected, op) }
 
-func (op Op) send() bool { return op == OpChatGPTSend || op == OpClaudeAISend }
+func (op Op) is(k opKind) bool {
+	_, kind, ok := op.resolve()
+	return ok && kind == k
+}
+
+func (op Op) file() bool { return op.is(opFile) }
+
+func (op Op) send() bool { return op.is(opSend) }
 
 // NativeRequest is one request to the extension.
 type NativeRequest struct {
@@ -275,6 +322,9 @@ type NativeError struct {
 	// RetryAfter is the site's Retry-After, in seconds, on a rate_limited
 	// error when the extension could read it (zero when unknown).
 	RetryAfter int `json:"retry_after,omitempty"`
+	// Clicked is set on a send that failed after its send button was
+	// clicked: the message may have been sent.
+	Clicked bool `json:"clicked,omitempty"`
 }
 
 // NativeChunk is one piece of a file's bytes, base64.
@@ -317,7 +367,20 @@ var (
 	// The send operations' page failures.
 	ErrComposerNotFound = errors.New("message box not found")
 	ErrSendFailed       = errors.New("send failed")
+	// ErrPermissionMissing: Chrome has not granted the extension the
+	// site's host access (an optional site not yet granted on the options
+	// page, or access the owner withheld).
+	ErrPermissionMissing = errors.New("site access not granted")
+	// ErrBlocked: the site answered with an anti-bot check (a Cloudflare
+	// challenge, a Google /sorry/ page, an anti-bot refusal) instead of
+	// its API.
+	ErrBlocked = errors.New("blocked by an anti-bot check")
+	// ErrPaused: the owner's dot is paused, so nothing was sent to it.
+	ErrPaused = errors.New("paused")
 )
+
+// OptionsPageHint says where the extension's site grants are made.
+const OptionsPageHint = "chrome://extensions > Agent Tincan History > Details > Extension options"
 
 // errHostClosed means the host ended a request without a final frame.
 var errHostClosed = errors.New("native host closed the connection")
@@ -330,13 +393,18 @@ type UnavailableError struct {
 	// RetryAfter is how long to wait before asking the site again, for
 	// ErrRateLimited (zero when the site did not say).
 	RetryAfter time.Duration
+	// Clicked: a send failed after its send button was clicked, so the
+	// message may have been sent anyway.
+	Clicked bool
 }
 
+// siteOf is a site's host, for error text (the source name for a site
+// outside the table).
 func siteOf(s Source) string {
-	if s == SourceClaudeAI {
-		return "claude.ai"
+	if site := siteFor(s); site != nil {
+		return site.host
 	}
-	return "chatgpt.com"
+	return string(s)
 }
 
 func (e *UnavailableError) Error() string {
@@ -349,6 +417,9 @@ func (e *UnavailableError) Error() string {
 		reason = "the Tincan Chrome extension is not connected (install it, then run tincan history install)"
 	case ErrNotLoggedIn:
 		reason = "not logged in to " + site + " in Chrome"
+		if s := siteFor(e.Source); s != nil && s.notLoggedIn != nil {
+			reason = s.notLoggedIn(e.Detail)
+		}
 	case ErrEndpointChanged:
 		reason = site + " changed its API"
 	case ErrTimeout:
@@ -359,6 +430,12 @@ func (e *UnavailableError) Error() string {
 		reason = "no message box on the " + site + " page (the page may have changed)"
 	case ErrSendFailed:
 		reason = "the message could not be sent on " + site
+	case ErrPermissionMissing:
+		reason = "the Tincan Chrome extension has no access to " + site + "; grant it on the extension's options page (" + OptionsPageHint + ")"
+	case ErrBlocked:
+		reason = site + " showed an anti-bot check; open " + site + " in Chrome, complete the check, then try again"
+	case ErrPaused:
+		reason = siteLabel(e.Source) + " is paused; unpause it in ChatGPT and ask again"
 	case ErrRateLimited:
 		// The detail (a URL path, a cooldown note) adds nothing for the
 		// reader.
@@ -366,7 +443,7 @@ func (e *UnavailableError) Error() string {
 	default:
 		reason = site + " request failed"
 	}
-	if e.Detail != "" && e.Kind != ErrChromeNotRunning && e.Kind != ErrExtensionNotConnected && e.Kind != ErrNotLoggedIn && e.Kind != ErrTimeout {
+	if e.Detail != "" && e.Kind != ErrChromeNotRunning && e.Kind != ErrExtensionNotConnected && e.Kind != ErrNotLoggedIn && e.Kind != ErrTimeout && e.Kind != ErrPermissionMissing && e.Kind != ErrPaused {
 		reason += " (" + e.Detail + ")"
 	}
 	return "source unavailable: " + string(e.Source) + ": " + reason
@@ -381,7 +458,7 @@ func unavailable(s Source, kind error, detail string) error {
 // rateLimitMessage is what a reply says when the site is rate-limiting the
 // owner's account.
 func rateLimitMessage(s Source) string {
-	return siteLabel(s) + " is rate-limiting this account right now; try again later"
+	return siteLimiter(s) + " is rate-limiting this account right now; try again later"
 }
 
 // rateLimited reports whether err is a rate limit, and how long the site
@@ -416,19 +493,34 @@ func clampRetryAfterSeconds(secs int) time.Duration {
 // locally after a 429 that carried no Retry-After.
 const DefaultRateLimitCooldown = 30 * time.Second
 
+// DefaultBlockedCooldown is how long every request to a site with a
+// blockedCooldown (Gemini, Perplexity, Copilot) is refused locally after
+// it showed an anti-bot check: time for the owner to clear it in Chrome,
+// without the agent tripping it again meanwhile.
+const DefaultBlockedCooldown = 5 * time.Minute
+
 // SiteCooldown remembers, per site, until when requests must not go to it
-// because it rate-limited the account. The zero value is ready to use.
+// because it rate-limited the account or showed an anti-bot check. The
+// zero value is ready to use.
 type SiteCooldown struct {
 	// Now is the clock (time.Now when nil).
 	Now   func() time.Time
 	mu    sync.Mutex
 	until map[Source]time.Time
+	// blocked marks a cooldown whose end was last set by an anti-bot
+	// check rather than a rate limit.
+	blocked map[Source]bool
 }
 
 func (c *SiteCooldown) now() time.Time { return orNow(c.Now) }
 
 // Note starts (or extends) src's cooldown to at least d from now.
-func (c *SiteCooldown) Note(src Source, d time.Duration) {
+func (c *SiteCooldown) Note(src Source, d time.Duration) { c.note(src, d, false) }
+
+// NoteBlocked starts (or extends) src's cooldown after an anti-bot check.
+func (c *SiteCooldown) NoteBlocked(src Source, d time.Duration) { c.note(src, d, true) }
+
+func (c *SiteCooldown) note(src Source, d time.Duration, blocked bool) {
 	if d <= 0 {
 		return
 	}
@@ -436,10 +528,19 @@ func (c *SiteCooldown) Note(src Source, d time.Duration) {
 	defer c.mu.Unlock()
 	if c.until == nil {
 		c.until = map[Source]time.Time{}
+		c.blocked = map[Source]bool{}
 	}
 	if t := c.now().Add(d); t.After(c.until[src]) {
 		c.until[src] = t
+		c.blocked[src] = blocked
 	}
+}
+
+// Blocked reports whether src's running cooldown is an anti-bot one.
+func (c *SiteCooldown) Blocked(src Source) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.until[src].After(c.now()) && c.blocked[src]
 }
 
 // Remaining is how much of src's cooldown is left (zero when none).
@@ -457,8 +558,18 @@ func (c *SiteCooldown) Remaining(src Source) time.Duration {
 // process.
 var sharedCooldown = &SiteCooldown{}
 
-// fromNativeError maps an extension error code to a typed error.
+// fromNativeError maps an extension error code to a typed error, and
+// carries a send's clicked mark over.
 func fromNativeError(s Source, ne *NativeError) error {
+	err := nativeErrorKind(s, ne)
+	var ue *UnavailableError
+	if ne.Clicked && errors.As(err, &ue) {
+		ue.Clicked = true
+	}
+	return err
+}
+
+func nativeErrorKind(s Source, ne *NativeError) error {
 	detail := clip(ne.Message, 200)
 	switch ne.Code {
 	case "not_logged_in":
@@ -468,7 +579,11 @@ func fromNativeError(s Source, ne *NativeError) error {
 	case "endpoint_changed":
 		return unavailable(s, ErrEndpointChanged, detail)
 	case "blocked":
-		return unavailable(s, ErrEndpointChanged, "blocked: "+detail)
+		return unavailable(s, ErrBlocked, detail)
+	case "paused":
+		return unavailable(s, ErrPaused, detail)
+	case "permission_missing":
+		return unavailable(s, ErrPermissionMissing, detail)
 	case "bad_request":
 		if detail == "unknown operation" {
 			detail = "unknown operation; the loaded extension is older than this tincan, reload it once from chrome://extensions"
@@ -526,13 +641,96 @@ func (c *Client) cooldown() *SiteCooldown {
 }
 
 // CooldownRemaining is how long requests to src are still held back after
-// a rate limit (zero when they are not).
+// a rate limit or an anti-bot check (zero when they are not).
 func (c *Client) CooldownRemaining(src Source) time.Duration { return c.cooldown().Remaining(src) }
+
+// cooldownError is the error a request to src gets during its cooldown:
+// a rate limit carrying the time left, or, after an anti-bot check, that
+// check again. It is nil when src is not cooling down.
+func (c *Client) cooldownError(src Source) error {
+	left := c.cooldown().Remaining(src)
+	if left <= 0 {
+		return nil
+	}
+	if c.cooldown().Blocked(src) {
+		return unavailable(src, ErrBlocked, "requests to it are held back for another "+left.Round(time.Second).String())
+	}
+	return &UnavailableError{Source: src, Kind: ErrRateLimited, Detail: "cooling down after a rate limit", RetryAfter: left}
+}
 
 // hitsSite reports whether op makes a request to the site. Closing a tab
 // does not, so it runs during a cooldown.
 func (op Op) hitsSite() bool {
-	return op != OpChatGPTClose && op != OpClaudeAIClose && op != OpExtensionReload
+	return !op.is(opClose) && op != OpExtensionReload
+}
+
+// ExtensionStatus is the native host's answer to OpHostStatus.
+type ExtensionStatus struct {
+	// Hello is true once the connected extension has said hello.
+	Hello   bool   `json:"hello"`
+	Version string `json:"version,omitempty"`
+	// Granted lists the op prefixes of the sites the extension has host
+	// access to (grantedPrefixes).
+	Granted []string `json:"granted"`
+}
+
+// granted reports whether src's site is in s.Granted: the site whose
+// grant it runs under (grantAs), else its own.
+func (s ExtensionStatus) granted(src Source) bool {
+	site := siteFor(src)
+	if site != nil && site.grantAs != "" {
+		site = siteFor(site.grantAs)
+	}
+	return site != nil && slices.Contains(s.Granted, site.opPrefix)
+}
+
+// grantedPrefixes is the op prefixes of the sites h says are granted. An
+// extension older than site grants sends no list; it has the host access
+// it always had, the alwaysGranted sites.
+func grantedPrefixes(h Hello) []string {
+	out := []string{}
+	for _, s := range webSites {
+		if (h.Granted == nil && s.alwaysGranted) || slices.Contains(h.Granted, s.opPrefix) {
+			out = append(out, s.opPrefix)
+		}
+	}
+	return out
+}
+
+// errNoHostStatus: the native host is older than OpHostStatus.
+var errNoHostStatus = errors.New("the native host does not report the extension's status")
+
+// ExtensionStatus asks the native host what it knows about the connected
+// extension. It fails when no host answers (Chrome or the extension is
+// not running) or the host is older than OpHostStatus.
+func (c *Client) ExtensionStatus(ctx context.Context) (ExtensionStatus, error) {
+	var st ExtensionStatus
+	if c.Channel == nil {
+		return st, ErrExtensionNotConnected
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	err := c.Channel.Exchange(ctx, NativeRequest{ID: requestSeq.Add(1), Op: OpHostStatus}, func(r NativeResponse) (bool, error) {
+		if r.Error != nil || !r.OK || json.Unmarshal(r.Result, &st) != nil {
+			return true, errNoHostStatus
+		}
+		return true, nil
+	})
+	return st, err
+}
+
+// CheckSiteGrant is web serve's startup check. It fails with
+// ErrPermissionMissing only when the extension is connected and reports
+// src ungranted. With no extension connected (launchd starts web serve at
+// login, often before Chrome) or an older host, it passes: the service
+// starts and answers each request with the not-connected or
+// permission_missing reply.
+func (c *Client) CheckSiteGrant(ctx context.Context, src Source) error {
+	st, err := c.ExtensionStatus(ctx)
+	if err != nil || !st.Hello || st.granted(src) {
+		return nil
+	}
+	return unavailable(src, ErrPermissionMissing, "")
 }
 
 // NewClient returns a client for the local native host socket.
@@ -550,22 +748,44 @@ func (c *Client) timeout(op Op) time.Duration {
 		return SendClientTimeout
 	case op.file():
 		return 90 * time.Second
+	case op.readsInTab():
+		return TabReadClientTimeout
 	}
 	return 30 * time.Second
 }
 
+// TabReadClientTimeout bounds a list read the extension makes in a tab of
+// its own (Copilot's sidebar): longer than the extension's 75 second
+// bound on such a read, which counts from when the extension queued it,
+// so time spent behind a send to the same site or in the 3 second gap
+// between reads is inside it; shorter than the native host's 2 minute
+// bound on a request.
+const TabReadClientTimeout = 100 * time.Second
+
+// readsInTab reports whether op is a list read the extension makes by
+// opening a tab (a site with listInTab).
+func (op Op) readsInTab() bool {
+	site, kind, ok := op.resolve()
+	return ok && kind == opList && site.listInTab
+}
+
 func (c *Client) exchange(ctx context.Context, op Op, args OpArgs, recv func(NativeResponse) (bool, error)) error {
 	src := op.source()
+	if src == "" {
+		return unknownOp(op)
+	}
 	if err := ValidateOp(op, args); err != nil {
 		return unavailable(src, ErrRejected, err.Error())
 	}
 	if c.Channel == nil {
 		return unavailable(src, ErrExtensionNotConnected, "")
 	}
-	// A site that rate-limited the account is not asked again until its
-	// cooldown ends.
-	if left := c.cooldown().Remaining(src); left > 0 && op.hitsSite() {
-		return &UnavailableError{Source: src, Kind: ErrRateLimited, Detail: "cooling down after a rate limit", RetryAfter: left}
+	// A site that rate-limited the account (or showed an anti-bot check)
+	// is not asked again until its cooldown ends.
+	if op.hitsSite() {
+		if cerr := c.cooldownError(src); cerr != nil {
+			return cerr
+		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout(op))
 	defer cancel()
@@ -579,6 +799,11 @@ func (c *Client) exchange(ctx context.Context, op Op, args OpArgs, recv func(Nat
 			after = DefaultRateLimitCooldown
 		}
 		c.cooldown().Note(src, after)
+	}
+	if errors.Is(err, ErrBlocked) {
+		if site := siteFor(src); site != nil && site.blockedCooldown > 0 {
+			c.cooldown().NoteBlocked(src, site.blockedCooldown)
+		}
 	}
 	var ue *UnavailableError
 	switch {
@@ -639,6 +864,10 @@ type SendResult struct {
 	// SubmittedAt is when the extension clicked send, in Unix
 	// milliseconds (zero if the extension did not say).
 	SubmittedAt int64 `json:"submitted_at"`
+	// MessageID is the id of the sent message in the conversation, when
+	// the extension confirmed it there (dots.send does); the reply wait
+	// binds to it.
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // Submitted returns SubmittedAt as a time, zero when unknown.
@@ -654,29 +883,34 @@ func (r SendResult) Submitted() time.Time {
 // message is submitted and the conversation id is known. It does not wait
 // for the reply: read it with the detail operation, then call Close.
 func (c *Client) Send(ctx context.Context, src Source, message, convID string, newChat bool) (SendResult, error) {
-	op := OpChatGPTSend
-	if src == SourceClaudeAI {
-		op = OpClaudeAISend
+	site, err := lookupSite(src)
+	if err != nil {
+		return SendResult{}, err
 	}
-	raw, err := c.Request(ctx, op, OpArgs{Message: message, ConversationID: convID, NewChat: newChat})
+	raw, err := c.Request(ctx, site.op(opSend), OpArgs{Message: message, ConversationID: convID, NewChat: newChat})
 	if err != nil {
 		return SendResult{}, err
 	}
 	var r SendResult
-	if err := json.Unmarshal(raw, &r); err != nil || !validNativeID(r.ConversationID) {
+	if err := json.Unmarshal(raw, &r); err != nil {
 		return SendResult{}, unavailable(src, ErrEndpointChanged, "unexpected send answer")
 	}
+	id, ok := site.canonical(r.ConversationID)
+	if !ok || !validNativeID(id) {
+		return SendResult{}, unavailable(src, ErrEndpointChanged, "unexpected send answer")
+	}
+	r.ConversationID = id
 	return r, nil
 }
 
 // Close closes the tab a send to src's conversation convID left open. It
 // never touches a tab the extension did not open for a send.
 func (c *Client) Close(ctx context.Context, src Source, convID string) error {
-	op := OpChatGPTClose
-	if src == SourceClaudeAI {
-		op = OpClaudeAIClose
+	site, err := lookupSite(src)
+	if err != nil {
+		return err
 	}
-	_, err := c.Request(ctx, op, OpArgs{ConversationID: convID})
+	_, err = c.Request(ctx, site.op(opClose), OpArgs{ConversationID: convID})
 	return err
 }
 
@@ -684,6 +918,9 @@ func (c *Client) Close(ctx context.Context, src Source, convID string) error {
 // size cap, chunk order and the announced size.
 func (c *Client) File(ctx context.Context, op Op, args OpArgs) ([]byte, string, error) {
 	src := op.source()
+	if src == "" {
+		return nil, "", unknownOp(op)
+	}
 	if !op.file() {
 		return nil, "", unavailable(src, ErrRejected, "not a file operation")
 	}
@@ -1042,6 +1279,16 @@ func (h *NativeHost) readChrome() error {
 	}
 }
 
+// status is the host's answer to OpHostStatus, from the last hello.
+func (h *NativeHost) status() ExtensionStatus {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.hello == nil {
+		return ExtensionStatus{Granted: []string{}}
+	}
+	return ExtensionStatus{Hello: true, Version: h.hello.Version, Granted: grantedPrefixes(*h.hello)}
+}
+
 func (h *NativeHost) forget(id int64) {
 	h.mu.Lock()
 	delete(h.pending, id)
@@ -1059,6 +1306,11 @@ func (h *NativeHost) serve(ctx context.Context, conn net.Conn) {
 	var req NativeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		_ = WriteMessage(conn, NativeResponse{Error: &NativeError{Code: "bad_request", Message: "malformed request"}}, MaxHostMessage)
+		return
+	}
+	if req.Op == OpHostStatus {
+		res, _ := json.Marshal(h.status())
+		_ = WriteMessage(conn, NativeResponse{ID: req.ID, OK: true, Result: res}, MaxHostMessage)
 		return
 	}
 	if err := ValidateOp(req.Op, req.Args); err != nil || req.Op == OpExtensionReload {

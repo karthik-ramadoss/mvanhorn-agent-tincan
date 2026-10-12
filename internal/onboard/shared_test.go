@@ -29,7 +29,7 @@ var tincanCmd = regexp.MustCompile(`(?:TINCAN_CONFIG=\S+ )?tincan (?:join|rejoin
 // every generated tincan command, set it in their MCP entry, and name the
 // agent on rejoin, so a second agent never acts as the first.
 func TestSharedKindsCarryPerAgentConfig(t *testing.T) {
-	shared := []string{KindHermes, KindOpenClaw, KindCodex}
+	shared := []string{KindHermes, KindOpenClaw, KindCodex, KindGeminiCLI, KindGrokCLI}
 	var roster []Member
 	for _, kind := range shared {
 		roster = append(roster, Member{Name: "a-" + kind, Kind: kind})
@@ -56,7 +56,7 @@ func TestSharedKindsCarryPerAgentConfig(t *testing.T) {
 		if !strings.Contains(setup, "TINCAN_CONFIG") || !strings.Contains(setup, "~/.config/tincan/"+name+".json") {
 			t.Errorf("%s MCP setup should set env TINCAN_CONFIG:\n%s", kind, setup)
 		}
-		if kind == KindCodex && !strings.Contains(setup, prefix+"tincan listen --exec") {
+		if (kind == KindCodex || kind == KindGeminiCLI || kind == KindGrokCLI) && !strings.Contains(setup, prefix+"tincan listen --exec") {
 			t.Errorf("codex listener lacks the per-agent config:\n%s", setup)
 		}
 		if strings.Contains(txt, "If another agent already runs on this machine") {
@@ -86,7 +86,7 @@ func TestClaudeCodeAndGenericGetConfigHint(t *testing.T) {
 }
 
 func TestOtherKindsUnchangedByConfigRules(t *testing.T) {
-	kinds := []string{KindVMWebhook, KindE2BEmail, KindProxySandbox, KindChatGPT}
+	kinds := []string{KindVMWebhook, KindE2BEmail, KindProxySandbox, KindChatGPT, KindScheduled}
 	var roster []Member
 	for _, kind := range kinds {
 		roster = append(roster, Member{Name: "a-" + kind, Kind: kind})
@@ -122,6 +122,8 @@ func TestExpectOnline(t *testing.T) {
 		{KindChatGPT, "none", false},
 		{KindCodex, "command", false},
 		{KindCodex, "webhook", false}, // non-generic kinds ignore wake
+		{KindScheduled, "schedule", false},
+		{KindGeneric, "schedule", false},
 		{"", "webhook", false},
 	}
 	for _, c := range cases {

@@ -24,22 +24,32 @@ var tmpl = template.Must(template.New("onboard").Funcs(template.FuncMap{
 
 // Kinds an agent block or recipe can be tailored to.
 const (
-	KindVMWebhook    = "vm-webhook"
-	KindE2BEmail     = "e2b-email"
-	KindProxySandbox = "proxy-sandbox"
-	KindClaudeCode   = "claude-code"
-	KindChatGPT      = "chatgpt"
-	KindHermes       = "hermes"
-	KindOpenClaw     = "openclaw"
-	KindCodex        = "codex"
-	KindHistory      = "history"
-	KindChatGPTWeb   = "chatgpt-web"
-	KindClaudeWeb    = "claude-web"
-	KindGeneric      = "generic"
+	KindVMWebhook     = "vm-webhook"
+	KindE2BEmail      = "e2b-email"
+	KindProxySandbox  = "proxy-sandbox"
+	KindClaudeCode    = "claude-code"
+	KindChatGPT       = "chatgpt"
+	KindHermes        = "hermes"
+	KindOpenClaw      = "openclaw"
+	KindCodex         = "codex"
+	KindGeminiCLI     = "gemini-cli"
+	KindGrokCLI       = "grok-cli"
+	KindHistory       = "history"
+	KindNotes         = "notes"
+	KindCouncil       = "council"
+	KindChatGPTWeb    = "chatgpt-web"
+	KindClaudeWeb     = "claude-web"
+	KindGrokWeb       = "grok-web"
+	KindGeminiWeb     = "gemini-web"
+	KindPerplexityWeb = "perplexity-web"
+	KindCopilotWeb    = "copilot-web"
+	KindDotWeb        = "dot-web"
+	KindScheduled     = "scheduled"
+	KindGeneric       = "generic"
 )
 
 // Kinds lists every agent kind in recipe order.
-var Kinds = []string{KindVMWebhook, KindE2BEmail, KindProxySandbox, KindClaudeCode, KindChatGPT, KindHermes, KindOpenClaw, KindCodex, KindHistory, KindChatGPTWeb, KindClaudeWeb, KindGeneric}
+var Kinds = []string{KindVMWebhook, KindE2BEmail, KindProxySandbox, KindClaudeCode, KindChatGPT, KindHermes, KindOpenClaw, KindCodex, KindGeminiCLI, KindGrokCLI, KindHistory, KindNotes, KindCouncil, KindChatGPTWeb, KindClaudeWeb, KindGrokWeb, KindGeminiWeb, KindPerplexityWeb, KindCopilotWeb, KindDotWeb, KindScheduled, KindGeneric}
 
 // KnownKind reports whether kind is empty (no kind) or one of Kinds.
 func KnownKind(kind string) bool { return kind == "" || slices.Contains(Kinds, kind) }
@@ -54,33 +64,89 @@ const (
 var Sections = []string{"operator", "agents", "recipes", "all"}
 
 // runtimeNames maps runtime names to kinds when nothing else says. Only
-// product runtimes and product agents (history) belong here, never anyone's
+// product runtimes and product agents (history, notes, council) belong here, never anyone's
 // personal agent names.
 var runtimeNames = map[string]string{
-	"claude-code": KindClaudeCode,
-	"chatgpt":     KindChatGPT,
-	"hermes":      KindHermes,
-	"openclaw":    KindOpenClaw,
-	"codex":       KindCodex,
-	"history":     KindHistory,
-	"chatgpt-web": KindChatGPTWeb,
-	"claude-web":  KindClaudeWeb,
+	"claude-code":    KindClaudeCode,
+	"chatgpt":        KindChatGPT,
+	"hermes":         KindHermes,
+	"openclaw":       KindOpenClaw,
+	"codex":          KindCodex,
+	"gemini-cli":     KindGeminiCLI,
+	"grok-cli":       KindGrokCLI,
+	"history":        KindHistory,
+	"notes":          KindNotes,
+	"council":        KindCouncil,
+	"chatgpt-web":    KindChatGPTWeb,
+	"claude-web":     KindClaudeWeb,
+	"grok-web":       KindGrokWeb,
+	"gemini-web":     KindGeminiWeb,
+	"perplexity-web": KindPerplexityWeb,
+	"copilot-web":    KindCopilotWeb,
+	"dot-web":        KindDotWeb,
 }
 
 // defaultWake is the wake method a kind normally uses.
 var defaultWake = map[string]string{
-	KindVMWebhook:    "webhook",
-	KindE2BEmail:     "email",
-	KindProxySandbox: "wait",
-	KindClaudeCode:   "channel",
-	KindChatGPT:      "none",
-	KindHermes:       "webhook",
-	KindOpenClaw:     "webhook",
-	KindCodex:        "command",
-	KindHistory:      "wait",
-	KindChatGPTWeb:   "wait",
-	KindClaudeWeb:    "wait",
-	KindGeneric:      "none",
+	KindVMWebhook:     "webhook",
+	KindE2BEmail:      "email",
+	KindProxySandbox:  "wait",
+	KindClaudeCode:    "channel",
+	KindChatGPT:       "none",
+	KindHermes:        "webhook",
+	KindOpenClaw:      "webhook",
+	KindCodex:         "command",
+	KindGeminiCLI:     "command",
+	KindGrokCLI:       "command",
+	KindHistory:       "wait",
+	KindNotes:         "wait",
+	KindCouncil:       "wait",
+	KindChatGPTWeb:    "wait",
+	KindClaudeWeb:     "wait",
+	KindGrokWeb:       "wait",
+	KindGeminiWeb:     "wait",
+	KindPerplexityWeb: "wait",
+	KindCopilotWeb:    "wait",
+	KindDotWeb:        "wait",
+	KindScheduled:     "schedule",
+	KindGeneric:       "none",
+}
+
+// stockGoodAt is the good-at line a fixed-job kind shows when the owner has
+// set none, condensed from that kind's instructions in agent.tmpl. Its keys
+// are exactly the kinds isService reports; general kinds have no stock line.
+var stockGoodAt = map[string]string{
+	KindHistory:       "answers questions about the owner's past ChatGPT, Claude, Grok, Gemini, Copilot and Codex chats, images included",
+	KindNotes:         "saves, searches and reads the owner's Agent Notes on their Mac; never edits or deletes one",
+	KindCouncil:       "puts one question to every model on the team, has them rank the answers blind, and returns a verdict",
+	KindChatGPTWeb:    "asks ChatGPT (chatgpt.com) in the owner's browser and replies with the answer and any generated images",
+	KindClaudeWeb:     "asks Claude (claude.ai) in the owner's browser and replies with the answer and any generated images",
+	KindGrokWeb:       "asks Grok (grok.com) in the owner's browser and replies with the answer and any generated images",
+	KindGeminiWeb:     "asks Gemini (gemini.google.com) in the owner's browser and replies with the answer and any generated images",
+	KindPerplexityWeb: "asks Perplexity (www.perplexity.ai) in the owner's browser and replies with the answer and its source links",
+	KindCopilotWeb:    "asks Microsoft Copilot (copilot.com) in the owner's browser and replies with the answer and its source links",
+	KindDotWeb:        "asks the owner's OpenAI dot (chatgpt.com/dots), which can act in the owner's connected apps",
+}
+
+// StockGoodAt returns the stock good-at line for kind, "" for a kind that
+// has none.
+func StockGoodAt(kind string) string { return stockGoodAt[kind] }
+
+// wakeMethodOrder is every wake method, in the order the operator prompt
+// lists them.
+var wakeMethodOrder = []string{"webhook", "email", "wait", "channel", "command", "schedule", "none"}
+
+// freshSession lists the kinds whose every wake starts a fresh session with
+// no memory of the last one; their instructions carry instructions.fresh.
+// They commonly share a machine with another agent, so their tincan commands
+// carry a per-agent TINCAN_CONFIG and their rejoin names the agent. A new
+// command-woken CLI kind is added here, not to template conditions.
+var freshSession = map[string]bool{
+	KindHermes:    true,
+	KindOpenClaw:  true,
+	KindCodex:     true,
+	KindGeminiCLI: true,
+	KindGrokCLI:   true,
 }
 
 // Member is one roster entry as the relay reports it.
@@ -134,6 +200,16 @@ const relayPlaceholder = "<relay-url>"
 type agentData struct {
 	Name, Kind, Wake, RelayURL, Owner, OwnerPoss string
 	Team                                         []string
+	// OwnConfig: every tincan command in the block carries TINCAN_CONFIG
+	// and the rejoin names the agent (fresh-session kinds and services).
+	OwnConfig bool
+	// Service: a Go service whose config file is named after its kind.
+	Service bool
+}
+
+func newAgentData(name, kind, wake, relay, owner string, team []string) agentData {
+	return agentData{Name: name, Kind: kind, Wake: wake, RelayURL: relay, Owner: owner, OwnerPoss: possessive(owner), Team: team,
+		OwnConfig: freshSession[kind] || isService(kind), Service: isService(kind)}
 }
 
 type teamLine struct {
@@ -188,7 +264,7 @@ func Build(o Options) (Kit, error) {
 			wake = defaultWake[kind]
 		}
 		wakes[wake] = true
-		d := agentData{Name: m.Name, Kind: kind, Wake: wake, RelayURL: relay, Owner: owner, OwnerPoss: possessive(owner), Team: others(names, m.Name)}
+		d := newAgentData(m.Name, kind, wake, relay, owner, others(names, m.Name))
 		b, err := agentBlock(d)
 		if err != nil {
 			return Kit{}, err
@@ -200,11 +276,11 @@ func Build(o Options) (Kit, error) {
 		op.Team = append(op.Team, teamLine{Name: m.Name, Kind: kind, Wake: wake, ExpectOnline: expectOnline(kind, wake)})
 	}
 	if len(roster) == 0 {
-		for _, w := range []string{"webhook", "email", "wait", "channel", "command", "none"} {
+		for _, w := range wakeMethodOrder {
 			wakes[w] = true
 		}
 	}
-	for _, w := range []string{"webhook", "email", "wait", "channel", "command", "none"} {
+	for _, w := range wakeMethodOrder {
 		if wakes[w] {
 			op.WakeMethods = append(op.WakeMethods, w)
 		}
@@ -250,9 +326,14 @@ func expectOnline(kind, wake string) bool {
 }
 
 // isService reports whether kind is a Tincan Go service rather than a
-// model: history and the web agents.
+// model: history, notes, council, and the web agents.
 func isService(kind string) bool {
-	return kind == KindHistory || kind == KindChatGPTWeb || kind == KindClaudeWeb
+	return kind == KindHistory || kind == KindNotes || kind == KindCouncil || isWebKind(kind)
+}
+
+// isWebKind reports whether kind is one of the web agents.
+func isWebKind(kind string) bool {
+	return kind == KindChatGPTWeb || kind == KindClaudeWeb || kind == KindGrokWeb || kind == KindGeminiWeb || kind == KindPerplexityWeb || kind == KindCopilotWeb || kind == KindDotWeb
 }
 
 func agentBlock(d agentData) (AgentBlock, error) {
@@ -286,7 +367,7 @@ func agentBlock(d agentData) (AgentBlock, error) {
 func recipes(relay, owner string) ([]Recipe, error) {
 	var out []Recipe
 	for _, kind := range Kinds {
-		d := agentData{Name: "<name>", Kind: kind, Wake: defaultWake[kind], RelayURL: relay, Owner: owner, OwnerPoss: possessive(owner)}
+		d := newAgentData("<name>", kind, defaultWake[kind], relay, owner, nil)
 		title, err := execute("title."+kind, d)
 		if err != nil {
 			return nil, err
@@ -422,4 +503,26 @@ func indent(s string) string {
 		b.WriteString("  " + l + "\n")
 	}
 	return b.String()
+}
+
+// Profile is how the kit reads one roster entry.
+type Profile struct {
+	Kind, Wake string
+	// Service: a Tincan Go service rather than a model agent. Web agents
+	// are services that front a model, so Web is set with it.
+	Service, Web bool
+	// ExpectOnline: the agent is normally connected, not woken on demand.
+	ExpectOnline bool
+}
+
+// ProfileOf resolves m's kind and wake method the way Build does (stored
+// kind, then runtime name, then generic; the kind's default wake when m
+// has none), so other packages classify agents exactly as the kit does.
+func ProfileOf(m Member) Profile {
+	kind := resolveKind(m, nil)
+	wake := m.Wake
+	if wake == "" {
+		wake = defaultWake[kind]
+	}
+	return Profile{Kind: kind, Wake: wake, Service: isService(kind), Web: isWebKind(kind), ExpectOnline: expectOnline(kind, wake)}
 }

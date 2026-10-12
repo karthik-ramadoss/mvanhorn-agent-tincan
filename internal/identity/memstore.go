@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 )
 
 // MemoryStore is an in-memory Store for tests and ephemeral runs.
@@ -18,11 +19,48 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{agents: map[string]Agent{}, invites: map[string]Invite{}}
 }
 
+func (m *MemoryStore) CreateAgent(_ context.Context, a Agent, now time.Time) (Agent, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, inv := range m.invites {
+		if inv.Name == a.Name && !inv.Expires.Before(now) {
+			return Agent{}, false, ErrPendingInvite
+		}
+	}
+	if old, ok := m.agents[a.Name]; ok {
+		if old.NodeID == a.NodeID && old.NodeName == a.NodeName && old.Kind == a.Kind {
+			return old, false, nil
+		}
+		return Agent{}, false, ErrEnrollmentConflict
+	}
+	m.agents[a.Name] = a
+	return a, true, nil
+}
+
 func (m *MemoryStore) PutAgent(_ context.Context, a Agent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Only SetAgentGoodAt writes the line; a rewrite keeps it.
+	a.GoodAt = m.agents[a.Name].GoodAt
 	m.agents[a.Name] = a
 	return nil
+}
+
+func (m *MemoryStore) ReplaceAgentNode(_ context.Context, name, expectedOld string, target Node, now time.Time) (Agent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.agents[name]
+	if !ok || a.NodeID != expectedOld {
+		return Agent{}, ErrEnrollmentConflict
+	}
+	for _, inv := range m.invites {
+		if inv.Name == name && !inv.Expires.Before(now) {
+			return Agent{}, ErrPendingInvite
+		}
+	}
+	a.NodeID, a.NodeName, a.NodeUser = target.ID, target.Name, target.User
+	m.agents[name] = a
+	return a, nil
 }
 
 func (m *MemoryStore) DeleteAgent(_ context.Context, name string) (bool, error) {
@@ -63,6 +101,17 @@ func (m *MemoryStore) SetAgentKind(_ context.Context, name, kind string) (bool, 
 	a, ok := m.agents[name]
 	if ok {
 		a.Kind = kind
+		m.agents[name] = a
+	}
+	return ok, nil
+}
+
+func (m *MemoryStore) SetAgentGoodAt(_ context.Context, name, line string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.agents[name]
+	if ok {
+		a.GoodAt = line
 		m.agents[name] = a
 	}
 	return ok, nil

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// live is the read flow the ChatGPT and claude.ai readers share: list
+// live is the read flow the live site readers share: list
 // through the extension, open conversations one at a time while pick needs
 // them, then fetch only the images of the turns that were selected.
 type live struct {
@@ -23,11 +23,22 @@ type live struct {
 	detailOp   Op
 	// parseList turns a list result into conversations without messages.
 	parseList func(raw json.RawMessage) ([]Conversation, error)
+	// listMore, when set, reports whether a list result was cut short
+	// with older conversations left unlisted, however many it holds.
+	listMore func(raw json.RawMessage) bool
 	// parseDetail turns a detail result into a thread whose images are
 	// placeholders made by imageRef.
 	parseDetail func(id string, raw json.RawMessage) (thread, error)
 	// fileArgs maps an image pointer to its file operation arguments.
 	fileArgs func(convID, pointer string) (Op, OpArgs, bool)
+	// canonID, when set, turns a conversation id in any of the site's
+	// forms into the canonical one every store holds.
+	canonID func(id string) (string, bool)
+	// undatedList: the list carries no times, newest first (Copilot's
+	// sidebar). Its conversations are never aged out by the list, and a
+	// read bounds each candidate's time by the one read before it, which
+	// the sidebar's order guarantees is no older.
+	undatedList bool
 }
 
 // imageRef is a placeholder image: the source's pointer and a display
@@ -48,21 +59,24 @@ func splitRef(img Image) (pointer, name string, ok bool) {
 func (l *live) clock() time.Time { return orNow(l.now) }
 
 // list asks the extension for the n newest conversations, newest first.
-func (l *live) list(ctx context.Context, n int) ([]Conversation, error) {
+// more says older conversations may be left unlisted: the list is full
+// (n, capped at MaxListCount), or the source says it was cut short.
+func (l *live) list(ctx context.Context, n int) (convs []Conversation, more bool, err error) {
 	n = min(max(n, 1), MaxListCount)
 	raw, err := l.client.Request(ctx, l.listOp, OpArgs{Count: n})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	convs, err := l.parseList(raw)
+	convs, err = l.parseList(raw)
 	if err != nil {
-		return nil, unavailable(l.source, ErrEndpointChanged, "unexpected list shape")
+		return nil, false, unavailable(l.source, ErrEndpointChanged, "unexpected list shape")
 	}
 	sort.SliceStable(convs, func(i, j int) bool { return convs[i].UpdatedAt.After(convs[j].UpdatedAt) })
 	if len(convs) > n {
 		convs = convs[:n]
 	}
-	return convs, nil
+	more = len(convs) >= n || (l.listMore != nil && l.listMore(raw))
+	return convs, more, nil
 }
 
 func (l *live) detail(ctx context.Context, id string) (thread, error) {
@@ -80,10 +94,19 @@ func (l *live) detail(ctx context.Context, id string) (thread, error) {
 // agentOwned returns the conversations the web agents sent into.
 func (l *live) agentOwned() map[string]bool { return loadWebUsed(l.agentChats) }
 
+// applied is the window a live read uses: the effective window with Max
+// capped at the extension's list cap. The cap never takes Max to zero or
+// below, which orDefault would silently reset to the default.
+func (l *live) applied(opts Options) Window {
+	w := effectiveWindow(l.window, opts)
+	w.Max = min(w.Max, MaxListCount)
+	return w
+}
+
 // List implements Reader.List.
-func (l *live) List(ctx context.Context, count int, opts Options) ([]Conversation, error) {
+func (l *live) List(ctx context.Context, count int, opts Options) (Page, error) {
 	if err := checkListCount(count); err != nil {
-		return nil, err
+		return Page{}, err
 	}
 	owned := l.agentOwned()
 	// Skipped web agent chats must not use up the count, so ask for
@@ -92,14 +115,16 @@ func (l *live) List(ctx context.Context, count int, opts Options) ([]Conversatio
 	if !opts.All {
 		fetch += len(owned)
 	}
-	convs, err := l.list(ctx, fetch)
+	convs, full, err := l.list(ctx, fetch)
 	if err != nil {
-		return nil, err
+		return Page{}, err
 	}
-	w, now := l.window.orDefault(), l.clock()
-	out := convs[:0]
+	w, now := l.applied(opts), l.clock()
+	page := Page{Window: w}
+	aged := false
 	for _, c := range convs {
-		if !w.fresh(c.UpdatedAt, now) {
+		if (!l.undatedList || !c.UpdatedAt.IsZero()) && !w.fresh(c.UpdatedAt, now) {
+			aged = true
 			continue
 		}
 		if owned[c.ID] {
@@ -108,40 +133,74 @@ func (l *live) List(ctx context.Context, count int, opts Options) ([]Conversatio
 			}
 			c.Automated = true
 		}
-		out = append(out, c)
-		if len(out) == count {
+		page.Conversations = append(page.Conversations, c)
+		if len(page.Conversations) == count {
 			break
 		}
 	}
-	return out, nil
+	if len(page.Conversations) < count {
+		switch {
+		case aged:
+			page.Limited = LimitAge
+		case full:
+			page.Limited = LimitCount
+		}
+	}
+	return page, nil
 }
 
 // Read implements Reader.Read.
-func (l *live) Read(ctx context.Context, q Query, opts Options) ([]Conversation, error) {
+func (l *live) Read(ctx context.Context, q Query, opts Options) (Page, error) {
 	if err := q.Validate(); err != nil {
-		return nil, err
+		return Page{}, err
 	}
 	if err := checkSource(l.source, q); err != nil {
-		return nil, err
+		return Page{}, err
 	}
+	w := l.applied(opts)
 	if q.Mode == ModeConversation {
+		if l.canonID != nil {
+			id, ok := l.canonID(q.ConversationID)
+			if !ok {
+				return Page{}, fmt.Errorf("invalid %s conversation id %q", l.source, q.ConversationID)
+			}
+			q.ConversationID = id
+		}
 		if !validNativeID(q.ConversationID) {
-			return nil, fmt.Errorf("invalid %s conversation id %q", l.source, q.ConversationID)
+			return Page{}, fmt.Errorf("invalid %s conversation id %q", l.source, q.ConversationID)
 		}
 		th, err := l.detail(ctx, q.ConversationID)
 		if err != nil {
-			return nil, err
+			return Page{}, err
 		}
 		out := []Conversation{conversationMessages(th, q.wantsImages())}
-		return l.resolve(ctx, out), nil
+		return Page{Conversations: l.resolve(ctx, out), Window: w}, nil
 	}
-	w, owned := l.window.orDefault(), l.agentOwned()
-	cands, err := l.list(ctx, w.Max)
+	owned := l.agentOwned()
+	// The web agents' chats are skipped below without using up a window
+	// slot, so ask for enough extra to cover them, as List does.
+	fetch := w.Max
+	if !opts.All {
+		fetch += len(owned)
+	}
+	// A full or cut-short list may have older conversations behind it.
+	cands, more, err := l.list(ctx, fetch)
 	if err != nil {
-		return nil, err
+		return Page{}, err
 	}
-	out, err := pick(q, w, l.clock(), len(cands),
-		func(i int) time.Time { return cands[i].UpdatedAt },
+	// prev is the time of the last candidate read, for an undated list.
+	var prev time.Time
+	now := l.clock()
+	page, err := pick(q, w, now, len(cands), more,
+		func(i int) time.Time {
+			if !l.undatedList || !cands[i].UpdatedAt.IsZero() {
+				return cands[i].UpdatedAt
+			}
+			if prev.IsZero() {
+				return now
+			}
+			return prev
+		},
 		func(i int) (thread, bool, error) {
 			if err := ctx.Err(); err != nil {
 				return thread{}, false, err
@@ -161,12 +220,26 @@ func (l *live) Read(ctx context.Context, q Query, opts Options) ([]Conversation,
 				th.conv.Title = cands[i].Title
 			}
 			th.conv.Automated = owned[cands[i].ID]
+			if l.undatedList {
+				// With no time from the list or the read, its age cannot
+				// be checked against the window, so it is not shown.
+				if th.conv.UpdatedAt.IsZero() {
+					return thread{}, false, nil
+				}
+				prev = th.conv.UpdatedAt
+				// Past the window's age: not shown, and the next
+				// candidate's bound (this time) stops the scan.
+				if !w.orDefault().fresh(prev, now) {
+					return thread{}, false, nil
+				}
+			}
 			return th, len(th.turns) > 0, nil
 		})
 	if err != nil {
-		return nil, err
+		return Page{}, err
 	}
-	return l.resolve(ctx, out), nil
+	page.Conversations = l.resolve(ctx, page.Conversations)
+	return page, nil
 }
 
 // resolve fetches the bytes of every placeholder image in convs. An image

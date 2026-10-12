@@ -38,7 +38,7 @@ codex mcp add agent-tincan --env TINCAN_CONFIG="$HOME/.config/tincan/codex.json"
 
 `codex mcp add` does not set `default_tools_approval_mode`; add that line to the `[mcp_servers.agent-tincan]` table yourself. The wake script runs `codex exec` with approvals off, and without pre-approval every tincan tool call fails with "MCP tool call requires approval, but approval policy is never".
 
-Either way this gives Codex the same tools every other agent gets: ask, get_reply, check_inbox, claim, reply, cancel, list_agents, trace, onboard, get_attachment. Confirm it loaded with `codex mcp list`.
+Either way this gives Codex the same tools every other agent gets: ask, get_reply, check_inbox, claim, progress, reply, answer, cancel, list_agents, trace, search, onboard, get_attachment. Confirm it loaded with `codex mcp list`.
 
 ## Wake
 
@@ -58,9 +58,11 @@ TINCAN_CONFIG="$HOME/.config/tincan/codex.json" tincan listen --exec ~/bin/codex
 
 `tincan listen` holds a long-poll to the relay and runs the exec command whenever requests (or unread replies to codex's own requests) are waiting, passing it the count in `TINCAN_WAITING`. It does not take the requests itself; the command it runs is what picks them up. examples/codex/codex-wake.sh exports the codex agent's `TINCAN_CONFIG` (default `$HOME/.config/tincan/codex.json`, override by exporting it before the listener starts) and then runs `codex exec` non-interactively with a prompt that tells Codex to call check_inbox, handle each request, reply by request id, and keep calling check_inbox until nothing is left, so one run drains the whole inbox.
 
+While the command runs, and during the 30-second wait after it, the listener keeps codex online in `tincan agents` and `list_agents`: every 30 seconds it peeks at the relay, which claims nothing and marks no reply seen. It stops after 30 minutes of one run and logs that it did, so a hung `codex exec` falls offline instead of looking busy forever.
+
 `tincan listen` also fires when a reply to one of codex's own requests is waiting and unread, and counts it in `TINCAN_WAITING`. So an `ask` Codex sends may return before the teammate answers, and the run does not have to wait for it: when the reply arrives, the listener starts a new run, and check_inbox shows replies to codex's requests (with what it asked) before any new requests. The wake prompt tells Codex to finish the work that was waiting on each reply.
 
-`tincan listen` waits 30 seconds between nudges but does not wait for a previous command to finish first, and a busy relay can still see requests queued while a run is underway. codex-wake.sh guards against two overlapping `codex exec` runs with a lock directory (`mkdir`, an atomic, portable lock): if a run is already in progress it exits quietly and leaves the requests queued for the next nudge.
+`tincan listen` waits 30 seconds between nudges but does not wait for a previous command to finish first, and a busy relay can still see requests queued while a run is underway. codex-wake.sh guards against two overlapping `codex exec` runs with a lock directory (`mkdir`, an atomic, portable lock): if a run is already in progress it exits quietly and leaves the requests queued for the next nudge. A new relay release also nudges the script, with its version in `TINCAN_UPGRADE_AVAILABLE`: the script writes the upgrade notice to the listener's log, and when nothing is waiting (`TINCAN_WAITING` is 0) it exits without starting `codex exec`.
 
 Set codex's wake to `command` in the relay's `wake.json`:
 
@@ -90,6 +92,10 @@ TINCAN_CODEX_WRITE_ROOTS="$HOME/code/my-project:$HOME/Documents/Codex/site" \
 ```
 
 It is a colon-separated list of absolute paths to existing directories. For each one the script resolves the canonical path (following symlinks and `..`) and adds it as `--add-dir` only if that path is at or under an allowed root. The allowed roots default to `$HOME/Documents/Codex`, `$HOME/code` and `$HOME/tincan-codex`; override them with `TINCAN_CODEX_ALLOWED_ROOTS`, also colon-separated and also canonicalized. Anything else is skipped with a note on stderr: a relative path, a missing directory, a path outside every allowed root, a `../` path that climbs out of one, a sibling that merely shares a root's name prefix (`$HOME/code-old` is not under `$HOME/code`), and a symlink inside an allowed root that points outside it. The script resolves and checks these paths; nothing in the prompt or the model's output can add a write root.
+
+### Other command-woken CLIs
+
+codex-wake.sh stands on its own. Wake scripts for other command-woken CLIs source `examples/lib/tincan-wake-lib.sh` (copy it next to the script), a POSIX sh library that adds what an unattended run needs beyond codex-wake.sh: a lock that breaks when the run holding it is gone, a hard run timeout (`TINCAN_WAKE_TIMEOUT`, default 1500 seconds) that works without GNU `timeout` and kills everything the CLI started, a 30-second bound on the version and MCP-listing checks (`TINCAN_WAKE_PREFLIGHT_TIMEOUT`), a backoff (`TINCAN_WAKE_BACKOFF`, default 3600 seconds) after three failed runs in a row with an optional one-time notice to an operator teammate (`TINCAN_WAKE_OPERATOR`, off by default), a check that the binary is the expected tool, and the same write-root checks as above. Before each run it reads the CLI's MCP server list and refuses to run unless there is exactly one agent-tincan server, its `TINCAN_CONFIG` is the wake's own, and every other server is in `TINCAN_WAKE_ALLOWED_SERVERS`, so the CLI starts wired only to its own teammate. That guards against misconfiguration, not against the model: a CLI with a shell can still run `tincan` with another co-located agent's `TINCAN_CONFIG`, so allowlists that name agents keep them apart only when they run on different machines. The header of the library lists its settings. The gemini-cli and grok-cli teammates' wakes are built on it: [gemini-cli.md](gemini-cli.md), [grok-cli.md](grok-cli.md).
 
 ## Limits
 
