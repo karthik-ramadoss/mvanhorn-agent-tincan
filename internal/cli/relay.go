@@ -390,7 +390,7 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	}
 	admin := client.Configure(&http.Server{Handler: srv.AdminHandler()}, client.RelayAPI)
 
-	errc := make(chan error, 3)
+	errc := make(chan error, 4) // API, admin, gateway and event worker
 	servers := []*http.Server{api, admin}
 	closeGW := func() {}
 	var gatewayServer *http.Server
@@ -435,7 +435,10 @@ func runRelay(ctx context.Context, f relayFlags) error {
 		go func() {
 			defer close(eventsRan)
 			if err := eventWorker.Run(runCtx); err != nil {
-				errc <- err
+				select {
+				case errc <- err:
+				case <-runCtx.Done():
+				}
 			}
 		}()
 	}
