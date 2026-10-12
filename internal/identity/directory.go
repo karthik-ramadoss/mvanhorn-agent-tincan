@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"regexp"
@@ -204,9 +205,7 @@ func NewDirectory(store Store, who Resolver, cfg Config) *Directory {
 		// Freeze the authorization policy so later caller map changes cannot
 		// silently add grants or race request attribution.
 		roles := make(map[string]string, len(cfg.ServiceRoles))
-		for tag, name := range cfg.ServiceRoles {
-			roles[tag] = name
-		}
+		maps.Copy(roles, cfg.ServiceRoles)
 		cfg.ServiceRoles = roles
 	}
 	if cfg.Now == nil {
@@ -478,7 +477,7 @@ func (d *Directory) RebindNode(ctx context.Context, remoteAddr, name, expectedOl
 
 func (d *Directory) enrollmentNode(ctx context.Context, name, stableID, ip, nodeName string) (Node, error) {
 	addr, err := netip.ParseAddr(ip)
-	if err != nil || addr.Zone() != "" || addr.Is4In6() || !(netip.MustParsePrefix("100.64.0.0/10").Contains(addr) || netip.MustParsePrefix("fd7a:115c:a1e0::/48").Contains(addr)) {
+	if err != nil || addr.Zone() != "" || addr.Is4In6() || (!netip.MustParsePrefix("100.64.0.0/10").Contains(addr) && !netip.MustParsePrefix("fd7a:115c:a1e0::/48").Contains(addr)) {
 		return Node{}, errors.New("enrollment requires a literal Tailscale IP")
 	}
 	if !ValidName(name) || !regexp.MustCompile(`^[A-Za-z0-9]{1,64}$`).MatchString(stableID) || !regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`).MatchString(nodeName) {

@@ -57,14 +57,12 @@ func TestCreateAgentEnrollment(t *testing.T) {
 	before, _, _ := st.AgentByName(ctx, "hermes")
 	a := identity.Agent{Name: "openai-dots", NodeID: "nDOTS", NodeName: "codex-environment-1", Kind: "codex", JoinedAt: c.t}
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 20 {
+		wg.Go(func() {
 			if _, _, err := st.CreateAgent(ctx, a, c.t); err != nil {
 				t.Error(err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if _, created, err := st.CreateAgent(ctx, a, c.t); err != nil || created {

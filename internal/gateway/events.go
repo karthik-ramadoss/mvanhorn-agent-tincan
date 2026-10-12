@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"mime"
 	"net/http"
 	"net/http/httptest"
@@ -127,9 +128,7 @@ func (g *Gateway) eventDispatch(next, discovery http.Handler) http.Handler {
 					}
 				}
 			}
-			for k, v := range rec.Header() {
-				w.Header()[k] = v
-			}
+			maps.Copy(w.Header(), rec.Header())
 			w.WriteHeader(rec.Code)
 			_, _ = w.Write(rec.Body.Bytes())
 		case "initialize", "ping", "tools/list", "notifications/initialized", "notifications/cancelled":
@@ -183,7 +182,7 @@ func validEventProtocol(w http.ResponseWriter, r *http.Request, in eventRPC) boo
 		return false
 	}
 	acceptsJSON := false
-	for _, accepted := range strings.Split(r.Header.Get("Accept"), ",") {
+	for accepted := range strings.SplitSeq(r.Header.Get("Accept"), ",") {
 		media, _, err := mime.ParseMediaType(strings.TrimSpace(accepted))
 		if err == nil && (media == "application/json" || media == "*/*") {
 			acceptsJSON = true

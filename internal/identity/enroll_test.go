@@ -68,14 +68,12 @@ func TestEnrollNodeConcurrentAndPending(t *testing.T) {
 	r := enrollResolver{node: identity.Node{ID: "nDOTS", Name: "codex-environment-1"}, online: true, found: true}
 	d := identity.NewDirectory(st, r, identity.Config{NoAutoRebind: true})
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 20 {
+		wg.Go(func() {
 			if _, _, err := d.EnrollNode(ctx, identity.LocalAdmin, "openai-dots", "codex", "nDOTS", "100.109.195.90", "codex-environment-1"); err != nil {
 				t.Error(err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if _, created, err := d.EnrollNode(ctx, identity.LocalAdmin, "openai-dots", "codex", "nDOTS", "100.109.195.90", "codex-environment-1"); err != nil || created {

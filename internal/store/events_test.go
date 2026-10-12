@@ -236,14 +236,12 @@ func TestEventConcurrentDeliveryLeaseAcrossStoreConnections(t *testing.T) {
 	errorsCh := make(chan error, 2)
 	var wg sync.WaitGroup
 	for _, st := range []*Store{s, other} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			d, err := st.LeaseEventDeliveries(context.Background(), 1, time.Minute)
 			results <- d
 			errorsCh <- err
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()

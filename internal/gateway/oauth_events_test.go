@@ -129,9 +129,9 @@ func (f *eventFixture) rpc(t *testing.T, token, method string, params map[string
 	var out map[string]any
 	content := w.Body.Bytes()
 	if strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
-		for _, line := range strings.Split(w.Body.String(), "\n") {
-			if strings.HasPrefix(line, "data: ") {
-				content = []byte(strings.TrimPrefix(line, "data: "))
+		for line := range strings.SplitSeq(w.Body.String(), "\n") {
+			if data, ok := strings.CutPrefix(line, "data: "); ok {
+				content = []byte(data)
 				break
 			}
 		}

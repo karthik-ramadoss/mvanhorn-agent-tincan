@@ -185,7 +185,7 @@ func TestWebhookRevalidatesDNSOnEveryAttempt(t *testing.T) {
 		}
 		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 	})
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := range 2 {
 		status, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
 		if attempt == 0 && (status != http.StatusAccepted || err != nil) {
 			t.Fatalf("first attempt: status %d, error %v", status, err)
@@ -230,7 +230,7 @@ func TestWebhookSigningExactBytesAndRotation(t *testing.T) {
 		timeCalls++
 		return time.Unix(1700000000+timeCalls, 0)
 	}
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		status, err := sender.Send(context.Background(), "sub_123", callback, secret, oldSecret, "evt_123", body)
 		if err != nil || status != http.StatusServiceUnavailable {
 			t.Fatalf("attempt %d: status %d error %v", i, status, err)
@@ -280,7 +280,7 @@ func TestWebhookVerificationFreshChallengeAndSignature(t *testing.T) {
 		}
 		json.NewEncoder(w).Encode(map[string]string{"challenge": verification.Challenge})
 	})
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := sender.Verify(context.Background(), "sub_1", callback, secret); err != nil {
 			t.Fatal(err)
 		}
