@@ -401,7 +401,7 @@ func TestEventSubscribeDoesNotReplayAcknowledgedHistory(t *testing.T) {
 	if err := s.DeleteEventSubscription(ctx, "grant-q", "q"); err != nil {
 		t.Fatalf("idempotent unsubscribe = %v", err)
 	}
-	if err := s.DeleteEventSubscription(ctx, "grant-q", "missing"); !errors.Is(err, ErrNotFound) {
+	if err := s.DeleteEventSubscription(ctx, "grant-q", "missing"); err != nil {
 		t.Fatalf("unknown subscription = %v", err)
 	}
 }

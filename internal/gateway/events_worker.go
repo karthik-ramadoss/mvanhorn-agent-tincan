@@ -100,7 +100,7 @@ func (w *EventDeliveryWorker) DeliverPending(ctx context.Context) error {
 		}
 		status, sendErr := w.sender.Send(ctx, sub.ID, sub.URL, sub.Secret, sub.PreviousSecret, d.Event.ID, body)
 		if status == 410 {
-			if err = w.store.DeleteEventSubscription(ctx, sub.Principal, sub.ID); err != nil {
+			if err = w.store.StopEventDeliverySubscription(ctx, sub.ID, d.Event.ID, d.LeaseToken, sub.Revision); err != nil && !errors.Is(err, store.ErrEventDeliveryLease) {
 				return err
 			}
 			continue

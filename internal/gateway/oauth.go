@@ -541,7 +541,6 @@ func (o *OAuth) RevokePrincipal(ctx context.Context, id string) error {
 	return tx.Commit()
 }
 
-// RevokeAgent deletes every token and pending code for an agent.
 // RevokeToken implements public-client token revocation for one connection.
 // Unknown tokens and a different registered client are intentionally no-ops.
 // It never changes the mailbox or its backend node binding.

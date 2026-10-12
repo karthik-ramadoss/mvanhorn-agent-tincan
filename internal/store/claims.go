@@ -36,6 +36,7 @@ func (s *Store) migrateClaims() error {
 		{"claim_actor", "TEXT NOT NULL DEFAULT ''"}, {"claim_task", "TEXT NOT NULL DEFAULT ''"},
 		{"claim_attempt", "TEXT NOT NULL DEFAULT ''"}, {"claim_generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"claim_released", "INTEGER NOT NULL DEFAULT 0"},
+		{"queue_generation", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var has bool
 		if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pragma_table_info('requests') WHERE name=?)`, col.name).Scan(&has); err != nil {
@@ -287,7 +288,7 @@ func (s *Store) ReleaseOwned(ctx context.Context, id, agent string, o envelope.C
 	}
 	if n == 0 {
 		var retry bool
-		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM requests WHERE id=? AND to_agent=? AND status='queued' AND claim_released=1 AND expires_at>?
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM requests WHERE id=? AND to_agent=? AND status IN ('queued','delivered') AND claim_released=1 AND expires_at>?
 		AND claim_actor=? AND claim_task=? AND claim_attempt=? AND claim_generation=?)`, id, agent, now, o.ActorID, o.TaskID, o.AttemptID, o.LeaseGeneration).Scan(&retry)
 		if err != nil {
 			return err

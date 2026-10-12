@@ -365,6 +365,7 @@ func runRelay(ctx context.Context, f relayFlags) error {
 		return err
 	}
 	waker := wake.New(wakeCfg, st, wake.Options{Online: srv.Online, Queued: srv.QueuedCount, UnseenReplies: srv.UnseenReplies, ReplyGrace: f.replyGrace})
+	defer waker.Stop()
 	srv.SetEvents(waker)
 	srv.SetWakeNamer(waker)
 	if err := resumeReplyWakes(ctx, st, waker); err != nil {
@@ -376,10 +377,6 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	runCtx, stopRun := context.WithCancel(ctx)
 	defer stopRun()
 	ran := make(chan struct{})
-	go func() {
-		defer close(ran)
-		srv.Run(runCtx)
-	}()
 
 	api := client.Configure(&http.Server{Handler: srv.Handler()}, client.RelayAPI)
 	adminSock := filepath.Join(f.stateDir, "admin.sock")
@@ -396,8 +393,10 @@ func runRelay(ctx context.Context, f relayFlags) error {
 	errc := make(chan error, 3)
 	servers := []*http.Server{api, admin}
 	closeGW := func() {}
-	go func() { errc <- api.Serve(ln) }()
-	go func() { errc <- admin.Serve(aln) }()
+	var gatewayServer *http.Server
+	var gatewayNet net.Listener
+	var eventWorker *gateway.EventDeliveryWorker
+	var eventsRan chan struct{}
 	if f.gateway {
 		gln, base, closeGWFn, err := gatewayListener(ctx, f)
 		if err != nil {
@@ -409,7 +408,6 @@ func runRelay(ctx context.Context, f relayFlags) error {
 		if err != nil {
 			return err
 		}
-		srv.SetConnector(gateway.Connector{Dir: dir, OAuth: oauth, Base: base})
 		g := gateway.New(base, oauth, srv.Handler(), Version)
 		if len(f.eventMailboxes) > 0 {
 			if err = oauth.ConfigureEvents(strings.TrimRight(base, "/")+"/mcp", f.eventMailboxes); err != nil {
@@ -420,18 +418,31 @@ func runRelay(ctx context.Context, f relayFlags) error {
 			}
 			sender := gateway.NewWebhookSender()
 			g.ConfigureEventStore(st, sender)
-			worker := gateway.NewEventDeliveryWorker(st, oauth, sender)
-			srv.SetEvents(eventDeliveryHints{base: waker, wake: worker.Wake})
-			go func() {
-				if err := worker.Run(ctx); err != nil {
-					errc <- err
-				}
-			}()
+			eventWorker = gateway.NewEventDeliveryWorker(st, oauth, sender)
+			srv.SetEvents(eventDeliveryHints{base: waker, wake: eventWorker.Wake})
 		}
+		srv.SetConnector(gateway.Connector{Dir: dir, OAuth: oauth, Base: base})
 		gw := client.Configure(&http.Server{Handler: g.Handler()}, client.RelayAPI)
-		go func() { errc <- gw.Serve(gln) }()
+		gatewayServer, gatewayNet = gw, gln
 		servers = append(servers, gw)
 		log.Printf("chatgpt gateway serving at %s/mcp", base)
+	}
+	// Policy, connector and hooks are immutable once listeners or sweep run.
+	// An event login cannot transiently bind as a full virtual agent at startup.
+	go func() { defer close(ran); srv.Run(runCtx) }()
+	if eventWorker != nil {
+		eventsRan = make(chan struct{})
+		go func() {
+			defer close(eventsRan)
+			if err := eventWorker.Run(runCtx); err != nil {
+				errc <- err
+			}
+		}()
+	}
+	go func() { errc <- api.Serve(ln) }()
+	go func() { errc <- admin.Serve(aln) }()
+	if gatewayServer != nil {
+		go func() { errc <- gatewayServer.Serve(gatewayNet) }()
 	}
 	log.Printf("tincan relay serving on %s (admin socket %s)", ln.Addr(), adminSock)
 
@@ -461,7 +472,13 @@ func runRelay(ctx context.Context, f relayFlags) error {
 		// drain below only waits for calls that are really working.
 		{"ending held polls", srv.Stop},
 		{"draining connections", func() { shutdown(servers) }},
-		{"stopping sweeps", func() { stopRun(); <-ran }},
+		{"stopping sweeps", func() {
+			stopRun()
+			<-ran
+			if eventsRan != nil {
+				<-eventsRan
+			}
+		}},
 		{"stopping wakes", waker.Stop},
 		{"closing the gateway", closeGW},
 		{"closing the tailnet listener", closeNet},

@@ -158,12 +158,20 @@ func validEventProtocol(w http.ResponseWriter, r *http.Request, in eventRPC) boo
 		eventRPCError(w, in.ID, -32602, "events require MCP 2.0 protocol version 2026-07-28 in header and metadata", nil)
 		return false
 	}
-	info, hasInfo := params.Meta[mcp.MetaKeyClientInfo].(map[string]any)
-	name, _ := info["name"].(string)
 	_, hasCaps := params.Meta[mcp.MetaKeyClientCapabilities].(map[string]any)
-	if !hasInfo || name == "" || !hasCaps {
+	if !hasCaps {
 		eventRPCError(w, in.ID, -32602, "MCP 2.0 client metadata required", nil)
 		return false
+	}
+	// Match SDK v1.8: clientInfo is optional. If supplied it must be a
+	// valid object; omitting it cannot make discovery and events disagree.
+	if rawInfo, present := params.Meta[mcp.MetaKeyClientInfo]; present {
+		var info mcp.Implementation
+		encoded, err := json.Marshal(rawInfo)
+		if rawInfo == nil || err != nil || json.Unmarshal(encoded, &info) != nil {
+			eventRPCError(w, in.ID, -32602, "invalid optional clientInfo", nil)
+			return false
+		}
 	}
 	if method := r.Header.Get("Mcp-Method"); method != "" && method != in.Method {
 		eventRPCError(w, in.ID, mcp.CodeHeaderMismatch, "Mcp-Method does not match request", nil)

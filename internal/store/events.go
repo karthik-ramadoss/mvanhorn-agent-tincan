@@ -29,11 +29,13 @@ var (
 type EventSubscription struct {
 	ID, Principal, Mailbox, Name, URL, Secret, PreviousSecret string
 	ExpiresAt, PreviousUntil                                  time.Time
+	Revision                                                  int64 // internal refresh/resubscribe fence, never event payload
 }
 
 // Event carries only identifiers and state, never request/reply bodies. Queue
-// generations combine the monotonically increasing claim and reply counters;
-// IDs include both counters so clarification resumes remain distinguishable.
+// generations are monotonically increasing queue transitions or the existing
+// reply generation. Delivery crashes before a claim still produce a new queue
+// generation; neither counter is the ownership lease generation.
 type Event struct {
 	ID, Name, Mailbox, RequestID, Status string
 	Generation                           int64
@@ -66,7 +68,8 @@ CREATE TABLE IF NOT EXISTS event_subscriptions (
  previous_until INTEGER NOT NULL DEFAULT 0,
  expires_at INTEGER NOT NULL,
  created_at INTEGER NOT NULL,
- revoked_at INTEGER NOT NULL DEFAULT 0
+ revoked_at INTEGER NOT NULL DEFAULT 0,
+ revision INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS event_subscriptions_mailbox ON event_subscriptions(mailbox,name);
 CREATE TABLE IF NOT EXISTS event_outbox (
@@ -97,13 +100,14 @@ CREATE TRIGGER IF NOT EXISTS event_outbox_deliveries AFTER INSERT ON event_outbo
 END;
 CREATE TRIGGER IF NOT EXISTS event_request_insert AFTER INSERT ON requests WHEN NEW.status='queued' BEGIN
  INSERT OR IGNORE INTO event_outbox(id,name,mailbox,request_id,status,generation,occurred_at,expires_at)
- VALUES ('tincan.request.queued:'||NEW.id||':'||NEW.claim_generation||':'||NEW.reply_generation,
- 'tincan.request.queued',NEW.to_agent,NEW.id,'queued',NEW.claim_generation+NEW.reply_generation,NEW.updated_at,NEW.updated_at+86400000);
+ VALUES ('tincan.request.queued:'||NEW.id||':'||NEW.queue_generation,
+ 'tincan.request.queued',NEW.to_agent,NEW.id,'queued',NEW.queue_generation,NEW.updated_at,NEW.updated_at+86400000);
 END;
 CREATE TRIGGER IF NOT EXISTS event_request_queue AFTER UPDATE OF status ON requests WHEN NEW.status='queued' AND OLD.status!='queued' BEGIN
+ UPDATE requests SET queue_generation=queue_generation+1 WHERE id=NEW.id;
  INSERT OR IGNORE INTO event_outbox(id,name,mailbox,request_id,status,generation,occurred_at,expires_at)
- VALUES ('tincan.request.queued:'||NEW.id||':'||NEW.claim_generation||':'||NEW.reply_generation,
- 'tincan.request.queued',NEW.to_agent,NEW.id,'queued',NEW.claim_generation+NEW.reply_generation,NEW.updated_at,NEW.updated_at+86400000);
+ SELECT 'tincan.request.queued:'||id||':'||queue_generation,
+ 'tincan.request.queued',to_agent,id,'queued',queue_generation,updated_at,updated_at+86400000 FROM requests WHERE id=NEW.id;
 END;
 CREATE TRIGGER IF NOT EXISTS event_reply_insert AFTER INSERT ON replies BEGIN
  INSERT OR IGNORE INTO event_outbox(id,name,mailbox,request_id,status,generation,occurred_at,expires_at)
@@ -148,8 +152,8 @@ func (s *Store) ReconcileEvents(ctx context.Context) error {
 func (s *Store) reconcileEvents(ctx context.Context, tx *sql.Tx) error {
 	now := s.now().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO event_outbox(id,name,mailbox,request_id,status,generation,occurred_at,expires_at)
- SELECT 'tincan.request.queued:'||id||':'||claim_generation||':'||reply_generation,'tincan.request.queued',to_agent,id,'queued',
- claim_generation+reply_generation,updated_at,updated_at+86400000 FROM requests WHERE status='queued' AND expires_at>?`, now); err != nil {
+ SELECT 'tincan.request.queued:'||id||':'||queue_generation,'tincan.request.queued',to_agent,id,'queued',
+ queue_generation,updated_at,updated_at+86400000 FROM requests WHERE status='queued' AND expires_at>?`, now); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO event_outbox(id,name,mailbox,request_id,status,generation,occurred_at,expires_at)
@@ -205,7 +209,7 @@ func (s *Store) PutEventSubscription(ctx context.Context, sub EventSubscription)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO event_subscriptions(id,principal,mailbox,name,url,secret,previous_secret,previous_until,expires_at,created_at)
  VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET secret=excluded.secret,previous_secret=excluded.previous_secret,
- previous_until=excluded.previous_until,expires_at=excluded.expires_at,revoked_at=0`,
+ previous_until=excluded.previous_until,expires_at=excluded.expires_at,revoked_at=0,revision=event_subscriptions.revision+1`,
 		sub.ID, sub.Principal, sub.Mailbox, sub.Name, sub.URL, sub.Secret, sub.PreviousSecret, eventTime(sub.PreviousUntil), sub.ExpiresAt.UnixMilli(), now.UnixMilli()); err != nil {
 		return EventSubscription{}, err
 	}
@@ -217,13 +221,18 @@ func (s *Store) PutEventSubscription(ctx context.Context, sub EventSubscription)
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO event_deliveries(subscription_id,event_id,available_at)
  SELECT ?,e.id,? FROM event_outbox e JOIN requests q ON q.id=e.request_id
  WHERE e.mailbox=? AND e.name=? AND e.expires_at>? AND (
- (e.name='tincan.request.queued' AND q.status='queued' AND q.expires_at>? AND e.id='tincan.request.queued:'||q.id||':'||q.claim_generation||':'||q.reply_generation) OR
+ (e.name='tincan.request.queued' AND q.status='queued' AND q.expires_at>? AND e.id='tincan.request.queued:'||q.id||':'||q.queue_generation) OR
  (e.name='tincan.reply.created' AND q.reply_seen_at=0 AND q.status IN ('answered','failed','declined','needs_input') AND e.generation=q.reply_generation))`,
 		sub.ID, now.UnixMilli(), sub.Mailbox, sub.Name, now.UnixMilli(), now.UnixMilli()); err != nil {
 		return EventSubscription{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return EventSubscription{}, err
+	}
+	if created {
+		sub.Revision = 1
+	} else {
+		sub.Revision = old.Revision + 1
 	}
 	return sub, nil
 }
@@ -235,12 +244,12 @@ func eventTime(t time.Time) int64 {
 	return t.UnixMilli()
 }
 
-const eventSubscriptionCols = `id, principal, mailbox, name, url, secret, previous_secret, expires_at, previous_until`
+const eventSubscriptionCols = `id, principal, mailbox, name, url, secret, previous_secret, expires_at, previous_until, revision`
 
 func scanEventSubscription(sc scanner, now time.Time) (EventSubscription, error) {
 	var sub EventSubscription
 	var expires, previous int64
-	err := sc.Scan(&sub.ID, &sub.Principal, &sub.Mailbox, &sub.Name, &sub.URL, &sub.Secret, &sub.PreviousSecret, &expires, &previous)
+	err := sc.Scan(&sub.ID, &sub.Principal, &sub.Mailbox, &sub.Name, &sub.URL, &sub.Secret, &sub.PreviousSecret, &expires, &previous, &sub.Revision)
 	if err != nil {
 		return EventSubscription{}, err
 	}
@@ -282,7 +291,7 @@ func (s *Store) DeleteEventSubscription(ctx context.Context, principal, id strin
 	defer tx.Rollback()
 	var owner string
 	if err := tx.QueryRowContext(ctx, `SELECT principal FROM event_subscriptions WHERE id=?`, id).Scan(&owner); errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
+		return nil
 	} else if err != nil {
 		return err
 	}
