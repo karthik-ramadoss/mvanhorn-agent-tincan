@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"slices"
@@ -95,12 +96,31 @@ func (s *Server) handleClaimRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	a, _ := r.Context().Value(authenticatedActorKey{}).(authenticatedActor)
 	in.Ownership.ActorID = a.ID
-	err = s.store.ReleaseOwned(r.Context(), r.PathValue("id"), name, *in.Ownership)
+	// Read immutable wake metadata before committing the release, so no
+	// post-commit lookup failure can drop the first transition's wake hint.
+	req, _, err := s.store.Request(r.Context(), r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			err = store.ErrClaimConflict
+		}
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	transitioned, err := s.store.ReleaseOwned(r.Context(), r.PathValue("id"), name, *in.Ownership)
 	if err != nil {
 		writeErr(w, statusFor(err), err)
 		return
 	}
-	s.hub.notify(requestKey(r.PathValue("id")))
-	s.hub.notify(inboxKey(name))
+	if transitioned {
+		s.hub.notify(requestKey(r.PathValue("id")))
+		s.hub.notify(inboxKey(name))
+		if s.events != nil {
+			if rq, ok := s.events.(Requeuer); ok {
+				rq.Requeued(r.Context(), req)
+			} else {
+				s.events.Queued(r.Context(), req)
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

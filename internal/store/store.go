@@ -797,7 +797,8 @@ func (s *Store) CountUrgentQueued(ctx context.Context, agent string) (int, error
 }
 
 // QueueStat is one agent's backlog: requests waiting to be claimed, the
-// creation time of the oldest of them, and claims whose lease is still live.
+// creation time of the oldest of them, and active claims, including owned
+// notifications whose request TTL is still live.
 type QueueStat struct {
 	Queued       int
 	OldestQueued time.Time
@@ -806,12 +807,14 @@ type QueueStat struct {
 
 // QueueStats returns every agent's backlog in one grouped query. Expired and
 // finished requests, claims whose lease ran out, and pings (answered
-// automatically, never work) are not counted.
+// automatically, never work) are not counted. Owned notifications have no
+// claim lease; their active lifetime is the request TTL instead.
 func (s *Store) QueueStats(ctx context.Context) (map[string]QueueStat, error) {
 	now := s.now().UnixMilli()
 	rows, err := s.db.QueryContext(ctx, `SELECT to_agent, status, COUNT(*), MIN(created_at)
 		FROM requests WHERE status IN ('queued', 'delivered', 'claimed') AND expires_at > ?
-		AND (status != 'claimed' OR lease_until > ?) AND kind != 'ping' GROUP BY to_agent, status`, now, now)
+		AND (status != 'claimed' OR lease_until > ? OR (kind='notify' AND claim_actor!='' AND lease_until=0))
+		AND kind != 'ping' GROUP BY to_agent, status`, now, now)
 	if err != nil {
 		return nil, err
 	}
@@ -1103,9 +1106,11 @@ func (s *Store) Sweep(ctx context.Context) ([]Transition, error) {
 	}
 	// A claim past its TTL expires once its lease runs out rather than going
 	// back to the queue, where it would only wake the agent for a request
-	// Deliver rejects.
+	// Deliver rejects. An owned notification has no claim lease to await, so
+	// it expires at its request TTL; legacy claimed notifications stay unchanged.
 	if err := collect(`UPDATE requests SET status = ?, lease_until = 0, updated_at = ?
-		WHERE (status IN (?, ?, ?) OR (status = ? AND lease_until > 0 AND lease_until <= ?)) AND expires_at <= ?
+		WHERE (status IN (?, ?, ?) OR (status = ? AND ((lease_until > 0 AND lease_until <= ?)
+		OR (kind='notify' AND claim_actor!='' AND lease_until=0)))) AND expires_at <= ?
 		RETURNING id, trace_id, from_agent, to_agent, status, urgent`,
 		string(envelope.StatusExpired), now, string(envelope.StatusQueued), string(envelope.StatusDelivered), string(envelope.StatusNeedsInput),
 		string(envelope.StatusClaimed), now, now); err != nil {

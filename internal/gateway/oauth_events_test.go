@@ -32,8 +32,8 @@ func (s *testEventSender) Verify(context.Context, string, string, string) error 
 	s.verifications++
 	return s.fail
 }
-func (*testEventSender) Send(context.Context, string, string, string, string, string, []byte) (int, error) {
-	return 204, nil
+func (*testEventSender) Send(context.Context, string, string, string, string, string, []byte) (int, time.Duration, error) {
+	return 204, 0, nil
 }
 
 type eventFixture struct {

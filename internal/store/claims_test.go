@@ -93,7 +93,7 @@ func TestOwnedClaimExpiryFencesAllMutations(t *testing.T) {
 	if _, err = s.Reply(stale, req.ID, "receiver", envelope.Reply{Status: envelope.StatusAnswered, Body: "old"}); !errors.Is(err, ErrClaimConflict) {
 		t.Fatal(err)
 	}
-	if err = s.ReleaseOwned(ctx, req.ID, "receiver", o); !errors.Is(err, ErrClaimConflict) {
+	if transitioned, err := s.ReleaseOwned(ctx, req.ID, "receiver", o); transitioned || !errors.Is(err, ErrClaimConflict) {
 		t.Fatal(err)
 	}
 	newOwner := claimTuple("node-b", "task-a", "attempt-2")
@@ -187,11 +187,11 @@ func TestOwnedReleaseAndInspectDoNotAcknowledge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = s.ReleaseOwned(ctx, req.ID, "receiver", *r.Ownership); err != nil {
-		t.Fatal(err)
+	if transitioned, err := s.ReleaseOwned(ctx, req.ID, "receiver", *r.Ownership); err != nil || !transitioned {
+		t.Fatal(transitioned, err)
 	}
-	if err = s.ReleaseOwned(ctx, req.ID, "receiver", *r.Ownership); err != nil {
-		t.Fatal(err)
+	if transitioned, err := s.ReleaseOwned(ctx, req.ID, "receiver", *r.Ownership); err != nil || transitioned {
+		t.Fatal(transitioned, err)
 	}
 	r, err = s.ClaimOwned(ctx, req.ID, "receiver", claimTuple("node-a", "task", "two"), time.Minute)
 	if err != nil {

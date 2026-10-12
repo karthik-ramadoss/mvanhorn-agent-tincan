@@ -98,7 +98,7 @@ func (w *EventDeliveryWorker) DeliverPending(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		status, sendErr := w.sender.Send(ctx, sub.ID, sub.URL, sub.Secret, sub.PreviousSecret, d.Event.ID, body)
+		status, retryAfter, sendErr := w.sender.Send(ctx, sub.ID, sub.URL, sub.Secret, sub.PreviousSecret, d.Event.ID, body)
 		if status == 410 {
 			if err = w.store.StopEventDeliverySubscription(ctx, sub.ID, d.Event.ID, d.LeaseToken, sub.Revision); err != nil && !errors.Is(err, store.ErrEventDeliveryLease) {
 				return err
@@ -113,7 +113,7 @@ func (w *EventDeliveryWorker) DeliverPending(ctx context.Context) error {
 		if terminal {
 			err = w.store.FailEventDelivery(ctx, sub.ID, d.Event.ID, d.LeaseToken)
 		} else {
-			err = w.store.FinishEventDelivery(ctx, sub.ID, d.Event.ID, d.LeaseToken, sendErr == nil && status >= 200 && status < 300, 0)
+			err = w.store.FinishEventDelivery(ctx, sub.ID, d.Event.ID, d.LeaseToken, sendErr == nil && status >= 200 && status < 300, retryAfter)
 		}
 		if err != nil && !errors.Is(err, store.ErrEventDeliveryLease) {
 			return err

@@ -241,10 +241,10 @@ func decodeAttachments(raw string) ([]envelope.Attachment, error) {
 // caller should now remove. An upload on no message is an orphan: after
 // orphanAge its row is deleted outright, finished or not. An attachment on
 // a request is kept until keepAfterDone after the request reached a final
-// state (answered, failed, declined, expired, cancelled, or claimed for a
-// notify, which has no lease and never leaves claimed unless the target
-// chooses to reply); then its row is marked deleted and kept, so the message
-// still lists what it carried.
+// state (answered, failed, declined, expired, or cancelled). Legacy claimed
+// notifications also count as consumed; owned notifications remain active
+// until a final transition. Then the attachment row is marked deleted and
+// kept, so the message still lists what it carried.
 func (s *Store) SweepAttachments(ctx context.Context, orphanAge, keepAfterDone time.Duration) ([]string, error) {
 	now := s.now()
 	var ids []string
@@ -269,7 +269,7 @@ func (s *Store) SweepAttachments(ctx context.Context, orphanAge, keepAfterDone t
 	}
 	if err := collect(`UPDATE attachments SET deleted_at = ?
 		WHERE deleted_at = 0 AND request_id IN (
-		  SELECT id FROM requests WHERE (status IN (?, ?, ?, ?, ?) OR (kind = ? AND status = ?)) AND updated_at <= ?)
+		  SELECT id FROM requests WHERE (status IN (?, ?, ?, ?, ?) OR (kind = ? AND status = ? AND claim_actor = '')) AND updated_at <= ?)
 		RETURNING id`,
 		now.UnixMilli(),
 		string(envelope.StatusAnswered), string(envelope.StatusFailed), string(envelope.StatusDeclined),

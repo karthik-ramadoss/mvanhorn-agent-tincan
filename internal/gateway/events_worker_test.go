@@ -20,13 +20,13 @@ type workerSender struct {
 }
 
 func (s *workerSender) Verify(context.Context, string, string, string) error { return nil }
-func (s *workerSender) Send(_ context.Context, _ string, _ string, _ string, _ string, id string, body []byte) (int, error) {
+func (s *workerSender) Send(_ context.Context, _ string, _ string, _ string, _ string, id string, body []byte) (int, time.Duration, error) {
 	s.ids = append(s.ids, id)
 	s.bodies = append(s.bodies, append([]byte(nil), body...))
 	if s.onSend != nil {
 		s.onSend()
 	}
-	return s.status, s.fail
+	return s.status, 0, s.fail
 }
 
 func workerPending(t *testing.T) (*eventFixture, Principal, store.EventSubscription, envelope.Request) {
