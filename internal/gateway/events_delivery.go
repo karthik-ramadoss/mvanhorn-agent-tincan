@@ -24,10 +24,11 @@ import (
 )
 
 const (
-	webhookMaxBody     = 256 << 10
-	webhookTimeout     = 10 * time.Second
-	verificationLimit  = 4 << 10
-	callbackURLMaxSize = 8192
+	webhookMaxBody       = 256 << 10
+	webhookTimeout       = 10 * time.Second
+	verificationLimit    = 4 << 10
+	callbackURLMaxSize   = 8192
+	webhookMaxRetryAfter = time.Hour // same bound as Store.FinishEventDelivery
 )
 
 // WebhookSender verifies a callback and makes one signed delivery attempt.
@@ -35,7 +36,7 @@ const (
 // of a previous signing secret belong to the subscription/outbox store.
 type WebhookSender interface {
 	Verify(ctx context.Context, subscriptionID, callbackURL, secret string) error
-	Send(ctx context.Context, subscriptionID, callbackURL, secret, previousSecret, eventID string, body []byte) (status int, err error)
+	Send(ctx context.Context, subscriptionID, callbackURL, secret, previousSecret, eventID string, body []byte) (status int, retryAfter time.Duration, err error)
 }
 
 // CallbackEndpointError provides the categorized reason used by MCP's
@@ -255,26 +256,46 @@ func (s *webhookSender) Verify(ctx context.Context, subscriptionID, callbackURL,
 	return nil
 }
 
-func (s *webhookSender) Send(ctx context.Context, subscriptionID, callbackURL, secret, previousSecret, eventID string, body []byte) (int, error) {
+func (s *webhookSender) Send(ctx context.Context, subscriptionID, callbackURL, secret, previousSecret, eventID string, body []byte) (int, time.Duration, error) {
 	if len(body) > webhookMaxBody {
-		return 0, callbackError("payload_too_large", nil)
+		return 0, 0, callbackError("payload_too_large", nil)
 	}
 	var envelope struct {
 		EventID string `json:"eventId"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil || envelope.EventID != eventID {
-		return 0, callbackError("invalid_payload", nil)
+		return 0, 0, callbackError("invalid_payload", nil)
 	}
 	ctx, cancel := context.WithTimeout(ctx, webhookTimeout)
 	defer cancel()
 	resp, err := s.post(ctx, subscriptionID, callbackURL, secret, previousSecret, eventID, body)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer resp.Body.Close()
 	// No retries occur here. The durable outbox records the received status;
 	// 410 and 413 must be final, while transient failures get bounded backoff.
-	return resp.StatusCode, nil
+	var retryAfter time.Duration
+	if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
+		if values := resp.Header.Values("Retry-After"); len(values) == 1 {
+			retryAfter = webhookRetryAfter(values[0], s.now())
+		}
+	}
+	return resp.StatusCode, retryAfter, nil
+}
+
+// Retry-After is either a non-negative integer number of seconds or an
+// HTTP-date. Invalid/past values fall back to the store's exponential delay.
+// Bound before converting seconds to Duration so a large value cannot wrap.
+func webhookRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.Trim(value, " \t")
+	if seconds, err := strconv.ParseUint(value, 10, 64); err == nil {
+		return time.Duration(min(seconds, uint64(webhookMaxRetryAfter/time.Second))) * time.Second
+	}
+	if date, err := http.ParseTime(value); err == nil && date.After(now) {
+		return min(date.Sub(now), webhookMaxRetryAfter)
+	}
+	return 0
 }
 
 func validWebhookHeader(value string) bool {

@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS event_outbox (
  occurred_at INTEGER NOT NULL,
  expires_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS event_outbox_expiry ON event_outbox(expires_at);
 CREATE TABLE IF NOT EXISTS event_deliveries (
  subscription_id TEXT NOT NULL REFERENCES event_subscriptions(id),
  event_id TEXT NOT NULL REFERENCES event_outbox(id),
@@ -93,6 +94,7 @@ CREATE TABLE IF NOT EXISTS event_deliveries (
  PRIMARY KEY(subscription_id,event_id)
 );
 CREATE INDEX IF NOT EXISTS event_deliveries_ready ON event_deliveries(state,available_at,lease_until);
+CREATE INDEX IF NOT EXISTS event_deliveries_event ON event_deliveries(event_id);
 CREATE TRIGGER IF NOT EXISTS event_outbox_deliveries AFTER INSERT ON event_outbox BEGIN
  INSERT OR IGNORE INTO event_deliveries(subscription_id,event_id,available_at)
  SELECT s.id,NEW.id,NEW.occurred_at FROM event_subscriptions s JOIN event_principals p ON p.principal=s.principal
@@ -151,15 +153,18 @@ func (s *Store) ReconcileEvents(ctx context.Context) error {
 
 func (s *Store) reconcileEvents(ctx context.Context, tx *sql.Tx) error {
 	now := s.now().UnixMilli()
+	// Purged generations must not reappear merely because the request remains
+	// queued or its reply remains unseen. Preserve the original event age.
+	cutoff := now - EventRetention.Milliseconds()
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO event_outbox(id,name,mailbox,request_id,status,generation,occurred_at,expires_at)
  SELECT 'tincan.request.queued:'||id||':'||queue_generation,'tincan.request.queued',to_agent,id,'queued',
- queue_generation,updated_at,updated_at+86400000 FROM requests WHERE status='queued' AND expires_at>?`, now); err != nil {
+ queue_generation,updated_at,updated_at+86400000 FROM requests WHERE status='queued' AND expires_at>? AND updated_at>?`, now, cutoff); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO event_outbox(id,name,mailbox,request_id,status,generation,occurred_at,expires_at)
  SELECT 'tincan.reply.created:'||q.id||':'||q.reply_generation,'tincan.reply.created',q.from_agent,q.id,r.status,
  q.reply_generation,r.created_at,r.created_at+86400000 FROM requests q JOIN replies r ON r.request_id=q.id
- WHERE q.reply_seen_at=0 AND q.status IN ('answered','failed','declined','needs_input')`)
+ WHERE q.reply_seen_at=0 AND q.status IN ('answered','failed','declined','needs_input') AND r.created_at>?`, cutoff)
 	return err
 }
 
@@ -344,12 +349,20 @@ func (s *Store) LeaseEventDeliveries(ctx context.Context, limit int, lease time.
 	}
 	defer tx.Rollback()
 	now := s.now().UnixMilli()
+	// Expired events already reject completions. Retain every delivery receipt
+	// through its event horizon, then remove children before their outbox rows
+	// in this maintenance transaction, including events with no subscriptions.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM event_deliveries WHERE event_id IN (SELECT id FROM event_outbox WHERE expires_at<=?)`, now); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM event_outbox WHERE expires_at<=? AND NOT EXISTS (SELECT 1 FROM event_deliveries WHERE event_id=event_outbox.id)`, now); err != nil {
+		return nil, err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE event_deliveries SET state='cancelled',lease_until=0 WHERE state IN ('pending','leased') AND subscription_id IN (
  SELECT s.id FROM event_subscriptions s JOIN event_principals p ON p.principal=s.principal WHERE s.revoked_at!=0 OR s.expires_at<=? OR p.revoked_at!=0)`, now); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE event_deliveries SET state='failed',lease_until=0 WHERE state IN ('pending','leased') AND
- ((attempts>=? AND lease_until<=?) OR event_id IN (SELECT id FROM event_outbox WHERE expires_at<=?))`, EventMaxAttempts, now, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE event_deliveries SET state='failed',lease_until=0 WHERE state IN ('pending','leased') AND attempts>=? AND lease_until<=?`, EventMaxAttempts, now); err != nil {
 		return nil, err
 	}
 	token, until := randomID(), s.now().Add(lease).UnixMilli()

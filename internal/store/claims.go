@@ -51,6 +51,12 @@ func (s *Store) migrateClaims() error {
 	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS claim_attempts(
 		request_id TEXT NOT NULL REFERENCES requests(id), actor TEXT NOT NULL,task TEXT NOT NULL,attempt TEXT NOT NULL,
 		generation INTEGER NOT NULL, PRIMARY KEY(request_id,actor,task,attempt))`)
+	if err != nil {
+		return err
+	}
+	// Older owned claims gave notify the ask/ping lease. Normalize before
+	// startup sweep can requeue a notice that its receiver already consumed.
+	_, err = s.db.Exec(`UPDATE requests SET lease_until=0 WHERE kind='notify' AND status='claimed' AND claim_actor!='' AND lease_until>0`)
 	return err
 }
 
@@ -60,6 +66,7 @@ func sameOwner(a *envelope.ClaimOwnership, b envelope.ClaimOwnership, generation
 
 // ClaimOwned performs a compare-and-swap in SQLite. A lost response is safe to
 // retry while the same lease is live; a lost lease requires a fresh attempt.
+// Notify claims have no lease and remain owned until release, reply, or TTL.
 func (s *Store) ClaimOwned(ctx context.Context, id, agent string, owner envelope.ClaimOwnership, lease time.Duration) (envelope.Request, error) {
 	if !ValidClaimOwner(owner, false) || lease <= 0 {
 		return envelope.Request{}, ErrClaimConflict
@@ -71,9 +78,9 @@ func (s *Store) ClaimOwned(ctx context.Context, id, agent string, owner envelope
 	defer tx.Rollback()
 	now := s.now().UTC().Truncate(time.Millisecond)
 	res, err := tx.ExecContext(ctx, `UPDATE requests SET status='claimed', claim_actor=?,claim_task=?,claim_attempt=?,
-		claim_generation=claim_generation+1,claim_released=0,lease_until=?,lease_paused=0,updated_at=?,progress_note='',progress_at=0
+		claim_generation=claim_generation+1,claim_released=0,lease_until=CASE WHEN kind='notify' THEN 0 ELSE ? END,lease_paused=0,updated_at=?,progress_note='',progress_at=0
 		WHERE id=? AND to_agent=? AND expires_at>? AND
-		(status IN ('queued','delivered') OR (status='claimed' AND lease_until>0 AND lease_until<=?)) AND
+		(status IN ('queued','delivered') OR (status='claimed' AND kind!='notify' AND lease_until>0 AND lease_until<=?)) AND
 		NOT (claim_actor=? AND claim_task=? AND claim_attempt=?) AND
 		NOT EXISTS(SELECT 1 FROM claim_attempts WHERE request_id=? AND actor=? AND task=? AND attempt=?)`, owner.ActorID, owner.TaskID, owner.AttemptID,
 		now.Add(lease).UnixMilli(), now.UnixMilli(), id, agent, now.UnixMilli(), now.UnixMilli(), owner.ActorID, owner.TaskID, owner.AttemptID, id, owner.ActorID, owner.TaskID, owner.AttemptID)
@@ -95,7 +102,7 @@ func (s *Store) ClaimOwned(ctx context.Context, id, agent string, owner envelope
 		return envelope.Request{}, ErrForbidden
 	}
 	if n == 0 {
-		if status != envelope.StatusClaimed || !sameOwner(req.Ownership, owner, false) || !req.Ownership.LeaseUntil.After(now) {
+		if status != envelope.StatusClaimed || !sameOwner(req.Ownership, owner, false) {
 			return envelope.Request{}, ErrClaimConflict
 		}
 		var alive bool
@@ -103,6 +110,18 @@ func (s *Store) ClaimOwned(ctx context.Context, id, agent string, owner envelope
 			return envelope.Request{}, err
 		}
 		if !alive {
+			return envelope.Request{}, ErrClaimConflict
+		}
+		if req.Kind == envelope.KindNotify {
+			// Normalize an existing finite notify lease from an older relay only
+			// for its authenticated owner; another task cannot take it by time.
+			if !req.Ownership.LeaseUntil.IsZero() {
+				if _, err := tx.ExecContext(ctx, `UPDATE requests SET lease_until=0 WHERE id=?`, id); err != nil {
+					return envelope.Request{}, err
+				}
+				req.Ownership.LeaseUntil = time.Time{}
+			}
+		} else if !req.Ownership.LeaseUntil.After(now) {
 			return envelope.Request{}, ErrClaimConflict
 		}
 	} else {
@@ -126,8 +145,8 @@ func (s *Store) progressOwned(ctx context.Context, id, agent string, o envelope.
 		return envelope.ErrBodyTooLarge
 	}
 	now := s.now().UnixMilli()
-	res, err := s.db.ExecContext(ctx, `UPDATE requests SET progress_note=?,progress_at=?,updated_at=?,lease_until=?
-		WHERE id=? AND to_agent=? AND status='claimed' AND expires_at>? AND lease_until>?
+	res, err := s.db.ExecContext(ctx, `UPDATE requests SET progress_note=?,progress_at=?,updated_at=?,lease_until=CASE WHEN kind='notify' THEN 0 ELSE ? END
+		WHERE id=? AND to_agent=? AND status='claimed' AND expires_at>? AND ((kind='notify' AND lease_until=0) OR lease_until>?)
 		AND claim_actor=? AND claim_task=? AND claim_attempt=? AND claim_generation=?`, note, now, now, s.now().Add(lease).UnixMilli(),
 		id, agent, now, now, o.ActorID, o.TaskID, o.AttemptID, o.LeaseGeneration)
 	if err != nil {
@@ -204,7 +223,7 @@ func (s *Store) replyOwned(ctx context.Context, id, agent string, o envelope.Cla
 		return old, tx.Commit()
 	}
 	now := s.now().UTC().Truncate(time.Millisecond)
-	if status != envelope.StatusClaimed || !req.Ownership.LeaseUntil.After(now) {
+	if status != envelope.StatusClaimed || !(req.Kind == envelope.KindNotify && req.Ownership.LeaseUntil.IsZero()) && !req.Ownership.LeaseUntil.After(now) {
 		return envelope.Reply{}, ErrClaimConflict
 	}
 	var exchanges string
@@ -221,7 +240,7 @@ func (s *Store) replyOwned(ctx context.Context, id, agent string, o envelope.Cla
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE requests SET status=?,lease_until=0,updated_at=?,reply_seen_at=CASE WHEN kind='ping' THEN ? ELSE 0 END,
 		reply_generation=reply_generation+1,lease_paused=?,exchanges=CASE WHEN ?='' THEN exchanges ELSE ? END
-		WHERE id=? AND to_agent=? AND status='claimed' AND expires_at>? AND lease_until>?
+		WHERE id=? AND to_agent=? AND status='claimed' AND expires_at>? AND ((kind='notify' AND lease_until=0) OR lease_until>?)
 		AND claim_actor=? AND claim_task=? AND claim_attempt=? AND claim_generation=?`, rep.Status, now.UnixMilli(), now.UnixMilli(),
 		rep.Status == envelope.StatusNeedsInput, exchanges, exchanges, id, agent, now.UnixMilli(), now.UnixMilli(), o.ActorID, o.TaskID, o.AttemptID, o.LeaseGeneration)
 	if err != nil {
@@ -246,7 +265,13 @@ func (s *Store) replyOwned(ctx context.Context, id, agent string, o envelope.Cla
 	if _, err = tx.ExecContext(ctx, `INSERT INTO replies(request_id,from_agent,status,body,created_at,attachments) VALUES(?,?,?,?,?,?)`, id, agent, rep.Status, rep.Body, now.UnixMilli(), atts); err != nil {
 		return envelope.Reply{}, err
 	}
-	if err = s.auditTx(ctx, tx, AuditEvent{Event: "replied", RequestID: id, TraceID: req.TraceID, Actor: o.ActorID, Detail: DetailJSON(map[string]any{"agent": agent, "status": rep.Status, "lease_generation": o.LeaseGeneration})}); err != nil {
+	event := "replied"
+	detail := map[string]any{"agent": agent, "status": rep.Status, "lease_generation": o.LeaseGeneration}
+	if rep.Status == envelope.StatusNeedsInput {
+		event = "needs_input"
+		detail["question_bytes"] = len(rep.Body)
+	}
+	if err = s.auditTx(ctx, tx, AuditEvent{Event: event, RequestID: id, TraceID: req.TraceID, Actor: o.ActorID, Detail: DetailJSON(detail)}); err != nil {
 		return envelope.Reply{}, err
 	}
 	return rep, tx.Commit()
@@ -266,40 +291,50 @@ func sameAttachmentIDs(a, b []envelope.Attachment) bool {
 
 // ReleaseOwned is idempotent for the last successful release only. Expired or
 // superseded workers cannot release a replacement generation.
-func (s *Store) ReleaseOwned(ctx context.Context, id, agent string, o envelope.ClaimOwnership) error {
+// transitioned is true only after a claimed-to-queued transaction commits.
+func (s *Store) ReleaseOwned(ctx context.Context, id, agent string, o envelope.ClaimOwnership) (transitioned bool, err error) {
 	if !ValidClaimOwner(o, true) {
-		return ErrClaimConflict
+		return false, ErrClaimConflict
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 	now := s.now().UnixMilli()
 	res, err := tx.ExecContext(ctx, `UPDATE requests SET status='queued',lease_until=0,claim_released=1,updated_at=?,progress_note='',progress_at=0
-		WHERE id=? AND to_agent=? AND status='claimed' AND expires_at>? AND lease_until>?
+		WHERE id=? AND to_agent=? AND status='claimed' AND expires_at>? AND ((kind='notify' AND lease_until=0) OR lease_until>?)
 		AND claim_actor=? AND claim_task=? AND claim_attempt=? AND claim_generation=?`, now, id, agent, now, now, o.ActorID, o.TaskID, o.AttemptID, o.LeaseGeneration)
 	if err != nil {
-		return err
+		return false, err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if n == 0 {
 		var retry bool
 		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM requests WHERE id=? AND to_agent=? AND status IN ('queued','delivered') AND claim_released=1 AND expires_at>?
 		AND claim_actor=? AND claim_task=? AND claim_attempt=? AND claim_generation=?)`, id, agent, now, o.ActorID, o.TaskID, o.AttemptID, o.LeaseGeneration).Scan(&retry)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !retry {
-			return ErrClaimConflict
+			return false, ErrClaimConflict
 		}
-	} else if err = s.auditTx(ctx, tx, AuditEvent{Event: "released", RequestID: id, Actor: o.ActorID, Detail: DetailJSON(map[string]any{"agent": agent, "lease_generation": o.LeaseGeneration})}); err != nil {
-		return err
+	} else {
+		var traceID string
+		if err = tx.QueryRowContext(ctx, `SELECT trace_id FROM requests WHERE id=?`, id).Scan(&traceID); err != nil {
+			return false, err
+		}
+		if err = s.auditTx(ctx, tx, AuditEvent{Event: "released", RequestID: id, TraceID: traceID, Actor: o.ActorID, Detail: DetailJSON(map[string]any{"agent": agent, "lease_generation": o.LeaseGeneration})}); err != nil {
+			return false, err
+		}
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // Inspect returns current state without delivery or reply acknowledgement.

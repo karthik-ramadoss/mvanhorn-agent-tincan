@@ -47,13 +47,13 @@ func TestClaimReleaseRetryAfterTakingPollBeforeNewGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = s.ReleaseOwned(t.Context(), req.ID, "receiver", *r.Ownership); err != nil {
+	if _, err = s.ReleaseOwned(t.Context(), req.ID, "receiver", *r.Ownership); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = s.Deliver(t.Context(), "receiver", 10, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.ReleaseOwned(t.Context(), req.ID, "receiver", *r.Ownership); err != nil {
+	if _, err = s.ReleaseOwned(t.Context(), req.ID, "receiver", *r.Ownership); err != nil {
 		t.Fatal(err)
 	}
 	_, st, err := s.Request(t.Context(), req.ID)

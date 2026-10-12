@@ -166,7 +166,7 @@ func TestWebhookRejectsMixedDNSBeforeDial(t *testing.T) {
 				t.Fatal("mixed DNS resolution reached dial")
 				return nil, nil
 			}
-			_, err := sender.Send(context.Background(), "sub_1", "https://callback.example", webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
+			_, _, err := sender.Send(context.Background(), "sub_1", "https://callback.example", webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
 			webhookReason(t, err, "blocked_address")
 		})
 	}
@@ -186,7 +186,7 @@ func TestWebhookRevalidatesDNSOnEveryAttempt(t *testing.T) {
 		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 	})
 	for attempt := range 2 {
-		status, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
+		status, _, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
 		if attempt == 0 && (status != http.StatusAccepted || err != nil) {
 			t.Fatalf("first attempt: status %d, error %v", status, err)
 		}
@@ -231,7 +231,7 @@ func TestWebhookSigningExactBytesAndRotation(t *testing.T) {
 		return time.Unix(1700000000+timeCalls, 0)
 	}
 	for i := range 2 {
-		status, err := sender.Send(context.Background(), "sub_123", callback, secret, oldSecret, "evt_123", body)
+		status, _, err := sender.Send(context.Background(), "sub_123", callback, secret, oldSecret, "evt_123", body)
 		if err != nil || status != http.StatusServiceUnavailable {
 			t.Fatalf("attempt %d: status %d error %v", i, status, err)
 		}
@@ -249,7 +249,7 @@ func TestWebhookDoesNotDuplicateIdenticalRotationKey(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	if _, err := sender.Send(context.Background(), "sub_1", callback, secret, secret, "evt_1", []byte(`{"eventId":"evt_1"}`)); err != nil {
+	if _, _, err := sender.Send(context.Background(), "sub_1", callback, secret, secret, "evt_1", []byte(`{"eventId":"evt_1"}`)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -370,7 +370,7 @@ func TestWebhookRedirectsAndProxyAreDisabled(t *testing.T) {
 		w.Header().Set("Location", "https://127.0.0.1/private")
 		w.WriteHeader(http.StatusTemporaryRedirect)
 	})
-	status, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
+	status, _, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
 	if err != nil || status != http.StatusTemporaryRedirect || callbackCalls.Load() != 1 || proxyCalls.Load() != 0 {
 		t.Fatalf("status %d error %v; callback requests %d; proxy requests %d", status, err, callbackCalls.Load(), proxyCalls.Load())
 	}
@@ -388,7 +388,7 @@ func TestWebhookRetainsCertificateHostnameVerification(t *testing.T) {
 	sender.resolver = webhookTestResolver(func(context.Context, string, string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
 	})
-	_, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
+	_, _, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
 	webhookReason(t, err, "delivery_failed")
 	if delivered.Load() != 0 {
 		t.Fatal("wrong certificate hostname received an event")
@@ -403,7 +403,7 @@ func TestWebhookReceivedStatusesReturnWithoutRetry(t *testing.T) {
 				calls.Add(1)
 				w.WriteHeader(want)
 			})
-			status, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
+			status, _, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
 			if status != want || err != nil || calls.Load() != 1 {
 				t.Fatalf("status %d error %v; attempts %d", status, err, calls.Load())
 			}
@@ -428,7 +428,7 @@ func TestWebhookInvalidInputNeverConnects(t *testing.T) {
 				t.Fatal("invalid input reached DNS")
 				return nil, nil
 			})
-			_, err := sender.Send(context.Background(), tc.subID, "https://callback.example", tc.secret, tc.previous, tc.id, []byte(tc.body))
+			_, _, err := sender.Send(context.Background(), tc.subID, "https://callback.example", tc.secret, tc.previous, tc.id, []byte(tc.body))
 			webhookReason(t, err, tc.reason)
 		})
 	}
@@ -449,7 +449,7 @@ func TestWebhookPayloadLimitIsInclusive(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	status, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", body)
+	status, _, err := sender.Send(context.Background(), "sub_1", callback, webhookTestSecret(1, 32), "", "evt_1", body)
 	if status != http.StatusNoContent || err != nil {
 		t.Fatalf("boundary delivery status %d error %v", status, err)
 	}
@@ -460,7 +460,7 @@ func TestWebhookDNSFailuresAreCategorizedAndRedacted(t *testing.T) {
 	sender.resolver = webhookTestResolver(func(context.Context, string, string) ([]netip.Addr, error) {
 		return nil, errors.New("DNS failed with sensitive details")
 	})
-	_, err := sender.Send(context.Background(), "sub_1", "https://callback.example?private=query", webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
+	_, _, err := sender.Send(context.Background(), "sub_1", "https://callback.example?private=query", webhookTestSecret(1, 32), "", "evt_1", []byte(`{"eventId":"evt_1"}`))
 	webhookReason(t, err, "dns_failed")
 	if strings.Contains(err.Error(), "sensitive") || strings.Contains(err.Error(), "private=query") {
 		t.Fatal("callback error exposed sensitive details")

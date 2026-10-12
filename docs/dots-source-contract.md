@@ -84,15 +84,21 @@ same reply route with `status:"needs_input"`; final statuses are `answered`,
 claims with a fresh attempt ID. The reply's `generation` is distinct from the
 ownership `lease_generation` and remains the existing acknowledgement fence.
 
-A live claim retried by the same actor/task/attempt returns its original
-generation and deadline. An identical committed reply retry returns the same
-reply and generation; changed payloads fail. Release retries are idempotent
+A live claim retried by the same actor/task/attempt returns the same generation
+and current deadline without renewing it. An identical committed reply retry
+returns the same reply and generation; changed payloads fail. Release retries are idempotent
 until another generation is acquired. Lease expiry, replacement, competing
 tasks/nodes, missing ownership and stale generations return HTTP 409:
 
 ```json
 {"error":"claim_conflict"}
 ```
+
+Notifications retain the existing one-time consumption behavior: an owned
+`notify` claim has no lease deadline, so `ownership.lease_until` is omitted.
+The actor/task/attempt/generation receipt and request TTL still fence mutations;
+progress does not give notifications a finite lease. A successful release
+emits the existing requeue wake hook once; idempotent release retries emit none.
 
 After a lease is lost, retry reads and recover task state before deciding to
 start a fresh attempt. Retired actor/task/attempt tuples remain recorded, so an
@@ -140,6 +146,12 @@ raw outstanding queue/reply state without `check_inbox`, delivery or sender
 Get acknowledgement. Stable event IDs and subscription/event primary keys
 deduplicate persistence; ambiguous callback receipts retry the same event ID.
 The receiver must deduplicate that ID because delivery is at least once.
+
+Maintenance removes expired delivery rows and their unreferenced expired event
+journal entries transactionally. Reconciliation preserves the original event
+age and cannot recreate expired entries. For HTTP 408, 429 and 5xx,
+`Retry-After` seconds or HTTP dates are honored subject to the existing
+exponential minimum, one-hour per-attempt cap and event/subscription expiry.
 
 Callbacks require a `whsec_` base64 key decoding to 24–64 bytes, verified with a
 fresh signed ten-second challenge. HTTPS destination addresses are checked
