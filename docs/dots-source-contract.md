@@ -97,7 +97,10 @@ tasks/nodes, missing ownership and stale generations return HTTP 409:
 Notifications retain the existing one-time consumption behavior: an owned
 `notify` claim has no lease deadline, so `ownership.lease_until` is omitted.
 The actor/task/attempt/generation receipt and request TTL still fence mutations;
-progress does not give notifications a finite lease. A successful release
+progress does not give notifications a finite lease. Owned notifications count
+as active claims until request TTL, then expire without requeueing. Their
+attachments remain active until a terminal transition and the usual retention
+period. Legacy notification behavior remains unchanged. A successful release
 emits the existing requeue wake hook once; idempotent release retries emit none.
 
 After a lease is lost, retry reads and recover task state before deciding to

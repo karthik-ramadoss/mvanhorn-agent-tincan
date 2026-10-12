@@ -223,7 +223,7 @@ func (s *Store) replyOwned(ctx context.Context, id, agent string, o envelope.Cla
 		return old, tx.Commit()
 	}
 	now := s.now().UTC().Truncate(time.Millisecond)
-	if status != envelope.StatusClaimed || !(req.Kind == envelope.KindNotify && req.Ownership.LeaseUntil.IsZero()) && !req.Ownership.LeaseUntil.After(now) {
+	if status != envelope.StatusClaimed || (req.Kind != envelope.KindNotify || !req.Ownership.LeaseUntil.IsZero()) && !req.Ownership.LeaseUntil.After(now) {
 		return envelope.Reply{}, ErrClaimConflict
 	}
 	var exchanges string
