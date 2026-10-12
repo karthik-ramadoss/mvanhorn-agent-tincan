@@ -14,10 +14,8 @@ func TestCreateAgentEnrollmentCompetingBindings(t *testing.T) {
 	st, c := open(t, ":memory:")
 	ctx := context.Background()
 	var wg sync.WaitGroup
-	for i := 0; i < 40; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+	for i := range 40 {
+		wg.Go(func() {
 			id := "nFIRST"
 			if i%2 == 1 {
 				id = "nSECOND"
@@ -26,7 +24,7 @@ func TestCreateAgentEnrollmentCompetingBindings(t *testing.T) {
 			if err != nil && !errors.Is(err, identity.ErrEnrollmentConflict) {
 				t.Error(err)
 			}
-		}(i)
+		})
 	}
 	wg.Wait()
 	a, found, err := st.AgentByName(ctx, "openai-dots")
