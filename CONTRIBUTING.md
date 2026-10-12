@@ -4,7 +4,7 @@ Thanks for helping with Agent Tincan. Many PRs here are written by coding agents
 
 ## Setup
 
-Go 1.26+ (see `go.mod`). Node is needed only if you change the Chrome extension. From the repo root:
+Go 1.26.9+ (see `go.mod`). Node is needed only if you change the Chrome extension. From the repo root:
 
 ```bash
 make build   # ./tincan

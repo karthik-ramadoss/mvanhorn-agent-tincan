@@ -20,7 +20,7 @@ curl -fsSL https://agenttincan.com/install.sh | sh
 
 It picks the build for the machine (macOS on Apple silicon or Intel, Linux on x86-64 or ARM64), downloads the newest stable release, checks it against the release's `checksums.txt`, installs it to `~/.local/bin/tincan` without `sudo`, and prints `tincan version`. If `~/.local/bin` is not on your PATH it tells you how to add it. `TINCAN_INSTALL_DIR=<dir>` installs elsewhere; `TINCAN_VERSION=v0.5.0` pins a release. Prereleases such as `v0.6.0-rc1` install only when `TINCAN_VERSION` names them.
 
-Or download manually from the [releases page](https://github.com/mvanhorn/agent-tincan/releases): `tincan_<os>_<arch>` plus `checksums.txt`. There is no Windows build; build from source with `make build` (Go 1.26 or newer).
+Or download manually from the [releases page](https://github.com/mvanhorn/agent-tincan/releases): `tincan_<os>_<arch>` plus `checksums.txt`. There is no Windows build; build from source with `make build` (Go 1.26.9 or newer).
 
 ## 3. Start the relay
 
